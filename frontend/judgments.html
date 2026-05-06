@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Artha Judge Operations Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/frontend/judgments.css">
+</head>
+<body>
+    <div class="app-shell">
+        <div class="workspace" id="operations">
+            <header class="topbar" aria-label="Console status">
+                <p class="eyebrow">Artha Judge Operations Console</p>
+            </header>
+
+            <section class="hero">
+                <div class="hero-copy">
+                    <p class="brand-kicker">Artha Judge</p>
+                    <h1>From judgment PDF to verified action<span>.</span></h1>
+                    <p class="lede">Upload or fetch a court judgment, review AI-proposed extraction and action items with source proof, then publish only verified records to the dashboard.</p>
+                </div>
+                <div class="hero-art" aria-hidden="true">
+                    <img src="/frontend/assets/theme11-judgment-seal.png" alt="">
+                </div>
+                <div class="hero-meta" aria-label="Session details">
+                    <div class="meta-block">
+                        <span class="meta-icon image-icon"><img src="/frontend/assets/meta-user.png" alt=""></span>
+                        <div>
+                            <span>User</span>
+                            <strong id="userDisplay">Not configured</strong>
+                        </div>
+                    </div>
+                    <div class="meta-block">
+                        <span class="meta-icon image-icon green"><img src="/frontend/assets/meta-api.png" alt=""></span>
+                        <div>
+                            <span>API</span>
+                            <strong id="apiStatus">Missing key</strong>
+                        </div>
+                    </div>
+                    <div class="meta-block">
+                        <span class="meta-icon image-icon shield"><img src="/frontend/assets/meta-shield.png" alt=""></span>
+                        <div>
+                            <span>Reviewer role</span>
+                            <select id="roleSelect">
+                                <option value="data_reviewer">Data Reviewer</option>
+                                <option value="legal_reviewer">Legal Reviewer</option>
+                                <option value="department_officer">Department Officer</option>
+                                <option value="admin">Admin</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <main class="ops-grid" id="judgments">
+                <section class="control-panel">
+                    <div class="panel-head">
+                        <h2>Intake</h2>
+                        <button id="refreshBtn" class="ghost-btn compact-btn"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-13.7 5.7M4 12A8 8 0 0 1 17.7 6.3M18 3v4h-4M6 21v-4h4"/></svg> Refresh</button>
+                    </div>
+                    <form id="uploadForm" class="stack">
+                        <label class="input-label"><span>1</span> Upload judgment PDF</label>
+                        <input id="pdfInput" type="file" accept=".pdf,application/pdf" required>
+                        <label class="check-row"><input id="syncMode" type="checkbox" checked> Process immediately for demo</label>
+                        <button class="primary-btn" type="submit"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0 4 4m-4-4-4 4M5 16v3h14v-3"/></svg> Upload Judgment</button>
+                    </form>
+                    <form id="ccmsForm" class="stack">
+                        <label class="input-label" for="ccmsCaseId"><span>2</span> Fetch from CCMS</label>
+                        <input id="ccmsCaseId" type="text" placeholder="CCMS case ID or DEMO-42">
+                        <button class="secondary-btn" type="submit"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h16M7 3.5h10a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2Zm2 7h6m-6 4h4m5-4h.01m-.01 4h.01"/></svg> Fetch CCMS Case</button>
+                    </form>
+                    <button id="demoSeedBtn" class="ghost-btn full-width"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h8l4 4v14H7V3Zm8 0v5h4M10 13h6M10 17h4"/></svg> Load Demo Judgment</button>
+                    <div id="taskStatus" class="task-status idle">
+                        <div class="task-status-top">
+                            <i></i>
+                            <div>
+                                <strong id="taskStatusTitle">No active task.</strong>
+                                <span id="taskStatusMessage">Upload or fetch a judgment to start the AI workflow.</span>
+                            </div>
+                        </div>
+                        <div class="task-progress-track" aria-hidden="true">
+                            <span id="taskProgressBar"></span>
+                        </div>
+                        <div id="taskStageList" class="task-stage-list"></div>
+                    </div>
+                </section>
+
+                <section class="board queue-board">
+                    <div class="board-head">
+                        <div>
+                            <p class="eyebrow">Human Verification</p>
+                            <h2>Review queue</h2>
+                        </div>
+                        <div class="tabs" id="queueTabs">
+                            <button class="ghost-btn active" data-status="">All</button>
+                            <button class="ghost-btn" data-status="pending_review">Pending</button>
+                            <button class="ghost-btn" data-status="needs_clarification">Escalated</button>
+                            <button class="ghost-btn" data-status="approved">Approved</button>
+                        </div>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Case</th>
+                                    <th>Court</th>
+                                    <th>Departments</th>
+                                    <th>Status</th>
+                                    <th>Risks</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="queueTableBody"></tbody>
+                        </table>
+                    </div>
+                    <div class="table-footer">
+                        <span id="queueCount">Showing 0 items</span>
+                        <div class="pager" aria-hidden="true">
+                            <button class="ghost-btn" type="button">‹</button>
+                            <strong>1</strong>
+                            <button class="ghost-btn" type="button">›</button>
+                        </div>
+                    </div>
+                </section>
+            </main>
+
+            <section class="board dashboard-board" id="dashboard">
+                <div class="board-head">
+                    <div>
+                        <p class="eyebrow">Trusted Dashboard</p>
+                        <h2>Verified action plans</h2>
+                    </div>
+                    <div class="filter-grid">
+                        <input id="filterCase" placeholder="Filter by case">
+                        <input id="filterDepartment" placeholder="Filter by department">
+                        <select id="filterActionType">
+                            <option value="">All action types</option>
+                            <option value="compliance">Compliance</option>
+                            <option value="appeal_consideration">Appeal consideration</option>
+                            <option value="legal_review">Legal review</option>
+                            <option value="affidavit_report_filing">Affidavit/report filing</option>
+                            <option value="payment_release">Payment/release</option>
+                            <option value="reconsideration">Reconsideration</option>
+                        </select>
+                        <button id="exportCsvBtn" class="ghost-btn compact-btn">Export CSV</button>
+                    </div>
+                </div>
+                <div class="kpi-strip" id="kpiStrip"></div>
+                <div id="metricsStrip" class="metrics-strip"></div>
+                <div class="table-wrap dashboard-table">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Case</th>
+                                <th>Departments</th>
+                                <th>Actions</th>
+                                <th>Categories</th>
+                                <th>Deadlines</th>
+                                <th>Status</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="recordsTableBody"></tbody>
+                    </table>
+                </div>
+            </section>
+
+            <aside class="review-pane" id="reviewPane" aria-label="Review screen">
+                <div class="review-scroll">
+                    <div class="review-head">
+                        <div>
+                            <p class="eyebrow">Review Screen</p>
+                            <h2 id="reviewTitle">Select a record</h2>
+                            <p id="reviewMeta" class="lede"></p>
+                        </div>
+                        <button class="review-close" id="closeReviewBtn" type="button" aria-label="Close review">
+                            <svg class="coolicon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+                        </button>
+                    </div>
+
+                    <div id="recordWarnings" class="warning-strip review-warning-strip"></div>
+                    <div id="duplicatePanel" class="duplicate-panel review-duplicate-panel"></div>
+
+                    <section class="review-card action-plan-review-card">
+                        <div class="review-card-head stacked">
+                            <div>
+                                <h3>Proposed Action Plan</h3>
+                                <p>Decision-ready action extracted from the judgment.</p>
+                            </div>
+                        </div>
+                        <div id="actionsContainer" class="action-plan-list"></div>
+                    </section>
+
+                    <section class="review-card extraction-review-card">
+                        <div class="review-card-head">
+                            <div>
+                                <h3>AI Extraction</h3>
+                                <p>Set each field status and reason before publishing.</p>
+                            </div>
+                            <button class="ghost-btn compact-btn" id="editBtn" type="button">
+                                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4Zm11-15 4 4"/></svg>
+                                Edit all
+                            </button>
+                        </div>
+                        <div id="recordMetrics" class="metrics-strip compact review-metrics"></div>
+                        <div id="fieldsContainer" class="review-list"></div>
+                    </section>
+
+                    <section class="review-card source-review-card">
+                        <div class="review-card-head">
+                            <h3>Original PDF / Source Highlights</h3>
+                            <div class="source-controls">
+                                <div class="pdf-viewer-toolbar" aria-label="PDF page controls">
+                                    <button class="ghost-btn pdf-page-btn" id="pdfPrevBtn" type="button" aria-label="Previous page">‹</button>
+                                    <label class="pdf-page-jump" for="pdfPageInput">
+                                        <span id="pdfPageLabel">Page</span>
+                                        <input id="pdfPageInput" class="pdf-page-input" type="number" min="1" value="1">
+                                        <span id="pdfPageTotal">of 1</span>
+                                    </label>
+                                    <button class="ghost-btn pdf-page-btn" id="pdfNextBtn" type="button" aria-label="Next page">›</button>
+                                </div>
+                                <a id="pdfLink" href="#" target="_blank" rel="noopener">Open</a>
+                            </div>
+                        </div>
+                        <div class="pdf-viewer-stage">
+                            <img id="pdfFrame" alt="Highlighted judgment PDF page preview" />
+                        </div>
+                    </section>
+
+                    <details class="review-details">
+                        <summary>Audit trail and notes</summary>
+                        <textarea id="reviewNotes" placeholder="Reviewer notes"></textarea>
+                        <div id="auditTimeline" class="audit-timeline"></div>
+                    </details>
+                </div>
+
+                <div class="review-actions">
+                    <button class="secondary-btn danger-btn" id="rejectBtn">
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+                        Reject
+                    </button>
+                    <button class="ghost-btn" id="escalateBtn">
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v5m0 4h.01M12 3 2 21h20L12 3Z"/></svg>
+                        Escalate
+                    </button>
+                    <button class="primary-btn" id="approveBtn">
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>
+                        Approve & Publish
+                    </button>
+                    <button class="ghost-btn quiet-action" id="completeBtn">Mark completed</button>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+    <script src="/frontend/judgments.js"></script>
+</body>
+</html>
