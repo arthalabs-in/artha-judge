@@ -187,10 +187,10 @@ async def create_demo_seed(user_id: str = Query(...)):
         user_id=user_id,
         pdf_path=str(pdf_path),
         record_id=record_id,
-        original_file_name="theme11_demo_judgment.pdf",
-        source_metadata={"source_system": "demo_seed", "ccms_case_id": "DEMO-42"},
+        original_file_name="34897.pdf",
+        source_metadata={"source_system": "demo_seed", "ccms_case_id": "DEMO-34897"},
         sync=True,
-        message="Demo judgment created for review.",
+        message="Demo judgment 34897.pdf created for review.",
     )
 
 
@@ -209,8 +209,8 @@ async def create_demo_seed_with_progress(user_id: str = Query(...)):
             user_id=user_id,
             pdf_path=str(pdf_path),
             record_id=record_id,
-            original_file_name="theme11_demo_judgment.pdf",
-            source_metadata={"source_system": "demo_seed", "ccms_case_id": "DEMO-42"},
+            original_file_name="34897.pdf",
+            source_metadata={"source_system": "demo_seed", "ccms_case_id": "DEMO-34897"},
             storage=get_storage(),
             canvas_app_id=CANVAS_APP_ID,
             processing_mode="progress",

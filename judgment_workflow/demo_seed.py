@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 from io import BytesIO
+from pathlib import Path
 
 import fitz
 
 
+def _real_demo_pdf_path() -> Path | None:
+    project_root = Path(__file__).resolve().parents[1]
+    candidates = [
+        project_root / "user_data" / "evaluation_inputs" / "34897.pdf",
+        project_root.parent / "user_data" / "evaluation_inputs" / "34897.pdf",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def build_demo_pdf_bytes() -> bytes:
+    real_demo_pdf = _real_demo_pdf_path()
+    if real_demo_pdf:
+        return real_demo_pdf.read_bytes()
+
     doc = fitz.open()
     page = doc.new_page()
     text = (
