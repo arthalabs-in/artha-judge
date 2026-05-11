@@ -9,7 +9,7 @@ DISPOSITION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("dismissed", re.compile(r"\b(?:petition|appeal|application)\s+(?:is\s+)?dismissed\b|\bdismissed\b", re.I)),
     ("disposed", re.compile(r"\b(?:petition|appeal|matter)\s+(?:is\s+)?disposed\b|\bdisposed\s+of\b", re.I)),
     ("quashed", re.compile(r"\bquash(?:ed|ing)?\b", re.I)),
-    ("remanded", re.compile(r"\bremand(?:ed)?\b", re.I)),
+    ("remanded", re.compile(r"\bremand(?:ed)?\b|\bremit(?:ted)?\b", re.I)),
 ]
 
 LEGAL_PHRASE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -25,7 +25,8 @@ LEGAL_PHRASE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 DEPARTMENT_PATTERN = re.compile(
-    r"\b(?:Government of [A-Z][A-Za-z ]+|State of [A-Z][A-Za-z ]+|[A-Z][A-Za-z& ]+ "
+    r"\b(?:High Court of [A-Z][A-Za-z .&-]+|Government of India|Government of [A-Z][A-Za-z]+|"
+    r"State of [A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+)?|[A-Z][A-Za-z& ]+ "
     r"(?:Department|Corporation|Authority|Board|Commissioner|Ministry|Police|Revenue|Municipality|Panchayat)|"
     r"BBMP|BDA|PWD|KSRTC|Devaswom Board|Travancore Devaswom Board)\b",
     re.I,
@@ -35,6 +36,9 @@ OPERATIVE_MARKER_RE = re.compile(
     r"\b(?:we\s+(?:direct|order|allow|dismiss|dispose)|"
     r"(?:is|are)\s+directed\s+to|ordered\s+to|"
     r"shall\s+(?:file|pay|release|reconsider|issue|remove|update|comply|provide|communicate|forward|send|retotal|re-total)|"
+    r"grant\s+leave\b.{0,160}\btag\s+this\s+appeal|tag\s+this\s+appeal|"
+    r"set\s+aside\b.{0,160}\bremit(?:ted)?\b|"
+    r"remit(?:ted)?\s+(?:the\s+)?(?:matters?|cases?|appeals?|petitions?)\s+to|"
     r"writ\s+petition\s+is\s+(?:allowed|dismissed|disposed)|petition\s+is\s+(?:allowed|dismissed|disposed))\b",
     re.I,
 )

@@ -679,7 +679,7 @@ def _extract_departments(extraction: JudgmentExtraction, document: Document, tex
     existing = list(extraction.departments.value or [])
     evidence = list(extraction.departments.evidence)
     for match in DEPARTMENT_PATTERN.finditer(text):
-        dept = _clean_party(match.group(0))
+        dept = _clean_department_entity(match.group(0))
         if not dept or len(dept) > 90 or dept.lower() in {"state"}:
             continue
         if dept not in existing:
@@ -826,6 +826,8 @@ def _extract_disposition(extraction: JudgmentExtraction, document: Document, tex
         if not matches:
             continue
         match = matches[-1]
+        if disposition == "allowed" and _looks_like_partly_allowed_context(text, match.start(), match.end()):
+            continue
         current_conf = extraction.disposition.confidence
         confidence = 0.82 if int((document.metadata or {}).get("page") or 0) > 1 else 0.65
         if confidence >= current_conf:
@@ -886,12 +888,20 @@ def _extract_final_disposition(extraction: JudgmentExtraction, documents: list[D
 def _disposition_candidate_patterns() -> list[tuple[str, re.Pattern[str]]]:
     return [
         ("leave_granted", re.compile(r"\b(?:accordingly,\s*)?(?:we\s+)?grant\s+leave\b|\bleave\s+(?:is\s+)?granted\b|\btag\s+this\s+appeal\b|\btagged\s+with\b|\b(?:list|tag|connect)\s+.{0,80}\balong\s+with\b", re.I)),
-        ("partly_allowed", re.compile(r"\b(?:partly|partially)\s+allow(?:ed)?\s+(?:the\s+)?(?:appeals?|petitions?|applications?)\b", re.I)),
+        ("partly_allowed", re.compile(r"\b(?:partly|partially)\s+allow(?:ed)?\s+(?:the\s+)?(?:appeals?|petitions?|applications?)\b|\b(?:appeals?|petitions?|applications?)\s+(?:are|is)\s+(?:partly|partially)\s+allowed\b|\b(?:partly|partially)\s+allowed\b", re.I)),
         ("allowed", re.compile(r"\b(?:we\s+)?allow(?:ed)?\s+(?:the\s+)?(?:appeals?|petitions?|applications?)\b|\b(?:appeals?|petitions?|applications?)\s+(?:are|is)\s+(?:accordingly\s+)?allowed\b", re.I)),
         ("dismissed", re.compile(r"\b(?:we\s+)?dismiss(?:ed)?\s+(?:the\s+)?(?:appeals?|petitions?|applications?)\b|\b(?:appeals?|petitions?|applications?)\s+(?:are|is)\s+dismissed\b", re.I)),
         ("disposed", re.compile(r"\b(?:we\s+)?dispose(?:d)?\s+(?:of\s+)?(?:the\s+)?(?:appeals?|petitions?|applications?|matter)\b|\bdisposed\s+of\b", re.I)),
         ("quashed", re.compile(r"\bquash(?:ed|ing)?\b", re.I)),
-        ("remanded", re.compile(r"\bremand(?:ed)?\b|\bremitted\s+back\b", re.I)),
+        (
+            "remanded",
+            re.compile(
+                r"\bremand(?:ed)?\b|\bremitted\s+back\b|"
+                r"\bremit(?:ted)?\s+(?:the\s+)?(?:matters?|cases?|appeals?|petitions?)\b|"
+                r"\b(?:matters?|cases?|appeals?|petitions?)\s+(?:is|are|stand|stands)\s+remitted\b",
+                re.I,
+            ),
+        ),
     ]
 
 
@@ -921,6 +931,11 @@ def _looks_like_non_final_disposition_text(text: str) -> bool:
     ))
 
 
+def _looks_like_partly_allowed_context(text: str, start: int, end: int) -> bool:
+    window = text[max(0, start - 40): min(len(text), end + 20)]
+    return bool(re.search(r"\b(?:partly|partially)\s+allowed\b", window, re.I))
+
+
 def _extract_legal_phrases(extraction: JudgmentExtraction, document: Document, text: str) -> None:
     existing = list(extraction.legal_phrases.value or [])
     evidence = list(extraction.legal_phrases.evidence)
@@ -943,7 +958,7 @@ def _extract_legal_phrases(extraction: JudgmentExtraction, document: Document, t
 
 
 def _extract_directions(extraction: JudgmentExtraction, document: Document, text: str) -> None:
-    sentences = re.split(r"(?<=[.!?])\s+", " ".join(text.split()))
+    sentences = _judgment_sentences(" ".join(text.split()))
     for sentence in sentences:
         clean = sentence.strip(" .")
         if len(clean) < 35 or len(clean) > 900:
@@ -967,6 +982,21 @@ def _extract_directions(extraction: JudgmentExtraction, document: Document, text
                 requires_review=True,
             )
         )
+
+
+def _judgment_sentences(text: str) -> list[str]:
+    protected = text
+    for abbreviation in ("C.A.No.", "C.A.", "S.L.P.", "W.P.", "Nos.", "No.", "Mr.", "Ms.", "Dr."):
+        protected = re.sub(
+            re.escape(abbreviation),
+            lambda match: match.group(0).replace(".", "<DOT>"),
+            protected,
+            flags=re.I,
+        )
+    return [
+        sentence.replace("<DOT>", ".")
+        for sentence in re.split(r"(?<=[.!?])\s+", protected)
+    ]
 
 
 def _looks_like_non_operational_reporter_direction(text: str) -> bool:
@@ -1029,6 +1059,34 @@ def _clean_party(value: str) -> str:
     value = re.sub(r"[….\s]*(?:Petitioner|Respondent|Appellant|Applicant|Ors?\.?|\(s\))+$", "", value, flags=re.I)
     value = re.sub(r"[^A-Za-z0-9)]+$", "", value)
     return value.strip(" .:-\n\t")
+
+
+def _clean_department_entity(value: str) -> str:
+    value = _clean_party(value)
+    value = re.sub(r"^(?:of|by|and|the|said)\s+", "", value, flags=re.I)
+    high_court = re.search(r"\bHigh\s+Court\s+of\s+[^).,;:]+", value, re.I)
+    if high_court:
+        name = re.split(
+            r"\b(?:in|for|from|dated|which|that|held|dismissed|at|vide|by|with|per)\b",
+            high_court.group(0),
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" .,:;-")
+        place = re.sub(r"^High\s+Court\s+of\s+", "", name, flags=re.I)
+        place = " ".join(part.capitalize() for part in place.split())
+        return f"High Court of {place}" if place else ""
+
+    government = re.search(r"\bGovernment\s+of\s+India\b", value, re.I)
+    if government:
+        return "Government of India"
+
+    value = re.sub(
+        r"\b(?:issued|produce|certified|established|respect of which|while|when|which)\b.*$",
+        "",
+        value,
+        flags=re.I,
+    ).strip(" .,:;-")
+    return value
 
 
 def _clean_law_report_party(value: str) -> str:

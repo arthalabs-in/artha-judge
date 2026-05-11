@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from .types import ActionCategory, ActionItem, JudgmentExtraction, Timeline
 
@@ -40,6 +39,10 @@ _REMAND_DESTINATION_RE = re.compile(
     r"\s+(?:for|to|with|per|pursuant|under|as directed|in accordance|$)",
     re.I,
 )
+_HIGH_COURT_SPECIFIC_RE = re.compile(
+    r"\b(?:the\s+)?High\s+Court\s+of\s+[A-Z][A-Za-z .&-]{2,90}\b",
+    re.I,
+)
 _PROCEDURAL_REGISTRY_RE = re.compile(
     r"\b(?:tag|tagged|connect|connected|list|listed)\b.{0,120}\b(?:appeal|matter|petition|case)\b|"
     r"\b(?:appeal|matter|petition|case)\b.{0,120}\b(?:tag|tagged|connect|connected|list|listed)\b",
@@ -74,7 +77,7 @@ def apply_inferred_action_owner(action: ActionItem, extraction: JudgmentExtracti
         action.responsible_department = None
         action.owner_source = None
 
-    owner, source = _owner_from_action_text(action)
+    owner, source = _owner_from_action_text(action, extraction)
     if owner:
         _apply_owner(action, owner, source)
         return action
@@ -110,7 +113,10 @@ def _clear_owner_unclear(action: ActionItem) -> None:
     ]
 
 
-def _owner_from_action_text(action: ActionItem) -> tuple[str | None, str | None]:
+def _owner_from_action_text(
+    action: ActionItem,
+    extraction: JudgmentExtraction | None = None,
+) -> tuple[str | None, str | None]:
     text = " ".join(
         str(value or "")
         for value in [
@@ -122,7 +128,8 @@ def _owner_from_action_text(action: ActionItem) -> tuple[str | None, str | None]
     )
     match = _REMAND_DESTINATION_RE.search(text)
     if match:
-        return _clean_entity(match.group("owner")), "remand_destination"
+        owner = _clean_entity(match.group("owner"))
+        return _specify_high_court(owner, text, extraction), "remand_destination"
     return None, None
 
 
@@ -172,34 +179,50 @@ def _is_unsafe_court_staff_owner(owner: str) -> bool:
     return bool(_UNSAFE_COURT_STAFF_OWNER_RE.search(str(owner or "")))
 
 
-def _single_public_owner(extraction: JudgmentExtraction) -> tuple[str | None, str | None]:
-    respondent_candidates = _public_entities(extraction.respondents.value)
-    if len(respondent_candidates) == 1:
-        return respondent_candidates[0], "inferred_public_respondent"
+def _specify_high_court(
+    owner: str,
+    action_text: str,
+    extraction: JudgmentExtraction | None = None,
+) -> str:
+    if owner.strip().casefold() != "high court":
+        return owner
+    candidates = _specific_high_court_candidates([action_text])
+    if extraction:
+        candidates.extend(_specific_high_court_candidates(_extraction_owner_context(extraction)))
+    unique = {candidate.casefold(): candidate for candidate in candidates}
+    return next(iter(unique.values())) if len(unique) == 1 else owner
 
-    department_candidates = _public_entities(extraction.departments.value)
-    if len(department_candidates) == 1:
-        return department_candidates[0], "inferred_public_department"
 
-    return None, None
-
-
-def _public_entities(value: Any) -> list[str]:
-    entities: list[str] = []
+def _specific_high_court_candidates(values) -> list[str]:
+    candidates: list[str] = []
     seen: set[str] = set()
-    for item in _as_strings(value):
-        cleaned = _clean_entity(item)
-        if not cleaned or not _PUBLIC_ENTITY_RE.search(cleaned):
-            continue
-        key = cleaned.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        entities.append(cleaned)
-    return entities
+    for value in values:
+        for match in _HIGH_COURT_SPECIFIC_RE.finditer(str(value or "")):
+            candidate = _normalize_high_court_name(match.group(0))
+            if not candidate:
+                continue
+            key = candidate.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+    return candidates
 
 
-def _as_strings(value: Any) -> list[str]:
+def _extraction_owner_context(extraction: JudgmentExtraction):
+    for field_name in ("departments", "court", "case_number", "respondents"):
+        field = getattr(extraction, field_name, None)
+        if not field:
+            continue
+        yield from _as_text_items(getattr(field, "value", None))
+        raw_value = getattr(field, "raw_value", None)
+        if raw_value:
+            yield str(raw_value)
+        for evidence in getattr(field, "evidence", []) or []:
+            yield getattr(evidence, "snippet", "")
+
+
+def _as_text_items(value) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
@@ -212,7 +235,7 @@ def _as_strings(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         items: list[str] = []
         for item in value:
-            items.extend(_as_strings(item))
+            items.extend(_as_text_items(item))
         return items
     return [str(value)]
 
@@ -220,4 +243,25 @@ def _as_strings(value: Any) -> list[str]:
 def _clean_entity(value: str) -> str:
     cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" .,:;-")
     cleaned = re.sub(r"^(?:the|said)\s+", "", cleaned, flags=re.I)
+    return cleaned
+
+
+def _normalize_high_court_name(value: str) -> str:
+    cleaned = _clean_entity(value)
+    cleaned = re.split(
+        r"\b(?:in|for|from|dated|which|that|held|dismissed|at|vide|by|with|per)\b|[).,;:]",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" .,:;-")
+    if not cleaned:
+        return ""
+    prefix = re.match(r"High\s+Court\s+of\s+(.+)$", cleaned, re.I)
+    if prefix:
+        place = " ".join(part.capitalize() for part in prefix.group(1).split())
+        return f"High Court of {place}"
+    suffix = re.match(r"(.+?)\s+High\s+Court$", cleaned, re.I)
+    if suffix:
+        place = " ".join(part.capitalize() for part in suffix.group(1).split())
+        return f"{place} High Court"
     return cleaned

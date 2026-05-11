@@ -170,6 +170,37 @@ def test_action_plan_uses_remand_destination_before_public_respondent():
     assert "owner_unclear" not in action.ambiguity_flags
 
 
+def test_action_plan_specifies_generic_high_court_from_case_context():
+    extraction = JudgmentExtraction(
+        respondents=ExtractedField("respondents", value=["Commissioner of Customs, Mumbai"]),
+        departments=ExtractedField("departments", value=["High Court of Bombay"]),
+        directions=[
+            ExtractedField(
+                "direction",
+                value=(
+                    "From the judgment and order of the High Court of Bombay. "
+                    "We set aside the impugned judgment and remit the cases to the High Court "
+                    "for fresh consideration."
+                ),
+                evidence=[
+                    SourceEvidence(
+                        "judgment.pdf",
+                        6,
+                        "p6",
+                        "we set aside the impugned judgment and remit the cases to the High Court for fresh consideration.",
+                    )
+                ],
+            )
+        ],
+    )
+
+    action = build_action_plan(extraction)[0]
+
+    assert action.responsible_department == "High Court of Bombay"
+    assert action.owner_source == "remand_destination"
+    assert action.responsible_department != "Commissioner of Customs, Mumbai"
+
+
 def test_action_plan_resolves_remit_to_high_court_per_order():
     extraction = JudgmentExtraction(
         respondents=ExtractedField("respondents", value=["Commissioner of Customs, Mumbai"]),
@@ -188,6 +219,44 @@ def test_action_plan_resolves_remit_to_high_court_per_order():
     assert action.owner_source == "remand_destination"
     assert action.timeline.timeline_type == "not_specified"
     assert "timeline_not_specified" in action.ambiguity_flags
+
+
+def test_action_plan_rejects_document_word_as_owner():
+    extraction = JudgmentExtraction(
+        directions=[
+            ExtractedField(
+                "direction",
+                value="The order shall be communicated to the Registrar General for necessary action.",
+                evidence=[
+                    SourceEvidence(
+                        "judgment.pdf",
+                        11,
+                        "p11",
+                        "The order shall be communicated to the Registrar General for necessary action.",
+                    )
+                ],
+            )
+        ],
+    )
+
+    action = build_action_plan(extraction)[0]
+
+    assert action.responsible_department is None
+    assert action.owner_source is None
+    assert "owner_unclear" in action.ambiguity_flags
+
+
+def test_disposition_only_action_does_not_assign_noisy_department():
+    extraction = JudgmentExtraction(
+        departments=ExtractedField("departments", value=["Government of India issued a Notification No"]),
+        disposition=ExtractedField("disposition", value="allowed", raw_value="appeals are allowed"),
+    )
+
+    action = build_action_plan(extraction)[0]
+
+    assert action.responsible_department is None
+    assert action.owner_source is None
+    assert "inferred_assignee_review" not in action.ambiguity_flags
 
 
 def test_supreme_court_labeled_parties_and_filename_date_are_preferred():
@@ -645,6 +714,56 @@ def test_final_disposition_prefers_allowed_outcome_over_remand_direction():
     assert package.extraction.disposition.value == "allowed"
 
 
+def test_partly_allowed_final_order_is_not_downgraded_to_allowed():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "In the result, the appeals are partly allowed. "
+                    "The claimants shall be entitled to enhanced compensation."
+                ),
+                metadata={"source": "judgment.pdf", "page": 11, "chunk_id": "p11"},
+            )
+        ]
+    )
+
+    assert package.extraction.disposition.value == "partly_allowed"
+    assert "partly allowed" in package.extraction.disposition.raw_value.lower()
+
+
+def test_plain_remit_final_order_extracts_remand_action_and_specific_owner():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "Petition for Special Leave to Appeal. "
+                    "From the judgment and order dated 01/10/2008 in CA No. 52/2008 "
+                    "of The HIGH COURT OF BOMBAY. "
+                    "Government of India issued a Notification No. 64 of 1988."
+                ),
+                metadata={"source": "judgment.pdf", "page": 1, "chunk_id": "p1"},
+            ),
+            Document(
+                page_content=(
+                    "On this ground alone we set aside the impugned judgment dated October 1, 2008 "
+                    "in Customs Appeal Nos. 52, 53 and 55 of 2008 and remit the cases to the High Court "
+                    "for fresh consideration in accordance with law."
+                ),
+                metadata={"source": "judgment.pdf", "page": 2, "chunk_id": "p2"},
+            ),
+        ]
+    )
+
+    assert package.extraction.disposition.value == "remanded"
+    assert package.extraction.directions
+    assert "Government of India issued" not in package.extraction.departments.value
+    action = package.action_items[0]
+    assert action.title.startswith("On this ground alone")
+    assert "fresh consideration" in action.title.lower()
+    assert action.responsible_department == "High Court of Bombay"
+    assert action.owner_source == "remand_destination"
+
+
 def test_final_order_grant_leave_beats_prior_dismissal_history():
     package = build_judgment_review_package(
         [
@@ -668,6 +787,27 @@ def test_final_order_grant_leave_beats_prior_dismissal_history():
     assert package.extraction.disposition.value == "leave_granted"
     assert "grant leave" in package.extraction.disposition.raw_value.lower()
     assert package.extraction.disposition.evidence[0].page == 8
+
+
+def test_grant_leave_tag_direction_creates_registry_action():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "Accordingly, we grant leave and tag this appeal with "
+                    "C.A.No.7295 of 2012 and C.A.No.11895 of 2014."
+                ),
+                metadata={"source": "judgment.pdf", "page": 8, "chunk_id": "p8"},
+            )
+        ]
+    )
+
+    assert package.extraction.disposition.value == "leave_granted"
+    assert package.extraction.directions
+    action = package.action_items[0]
+    assert "tag this appeal" in action.title.lower()
+    assert action.responsible_department == "Registry"
+    assert action.owner_source == "procedural_registry"
 
 
 def test_signature_block_extracts_multiple_judges_with_date_between():
