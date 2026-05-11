@@ -119,6 +119,17 @@ async def process_judgment_file(
     stage_started_at = perf_counter()
     pdf_profile = profile_from_ocr_status(pdf_path, ocr_status)
     record_stage("pdf_profile", stage_started_at)
+    text_layer_rejected = not bool(ocr_status.get("text_layer_reliable", True))
+    vision_ocr_required = bool(ocr_status.get("needs_ocr"))
+    vision_extractor = get_configured_vision_extractor(force_ollama=vision_ocr_required)
+    if text_layer_rejected:
+        source_metadata["text_layer_rejected"] = True
+        source_metadata["ocr_routing"] = "vision_ocr_only"
+        source_metadata["vision_ocr_model"] = getattr(vision_extractor, "model", "openbmb/minicpm-o2.6:latest")
+        pdf_profile["text_layer_rejected"] = True
+    elif vision_ocr_required and vision_extractor is not None:
+        source_metadata["ocr_routing"] = "vision_ocr_fallback"
+        source_metadata["vision_ocr_model"] = getattr(vision_extractor, "model", "openbmb/minicpm-o2.6:latest")
     if duplicate_candidates:
         source_metadata["duplicate_warning"] = True
     if embedding_model is None:
@@ -131,7 +142,7 @@ async def process_judgment_file(
         progress_callback(stage="ocr_detection", message="Checking whether OCR is needed...", pct=35.0)
 
     ocr_documents = []
-    if ocr_status["needs_ocr"]:
+    if ocr_status["needs_ocr"] and vision_extractor is None:
         ocr_documents, ocr_result = await timed_to_thread(
             "ocr_execution",
             ocr_pdf_with_tesseract,
@@ -144,6 +155,12 @@ async def process_judgment_file(
         if ocr_result.get("reason"):
             source_metadata["ocr_reason"] = ocr_result["reason"]
             pdf_profile["ocr_reason"] = ocr_result["reason"]
+    elif text_layer_rejected:
+        source_metadata["ocr_reason"] = "corrupted_text_layer_routed_to_minicpm_vision"
+        pdf_profile["ocr_reason"] = source_metadata["ocr_reason"]
+    elif vision_ocr_required:
+        source_metadata["ocr_reason"] = "routed_to_minicpm_vision"
+        pdf_profile["ocr_reason"] = source_metadata["ocr_reason"]
 
     merged_documents = _prepare_review_documents(
         documents=documents,
@@ -153,7 +170,8 @@ async def process_judgment_file(
         original_file_name=original_file_name,
         source_metadata=source_metadata,
         pdf_profile=pdf_profile,
-        vision_enabled=get_configured_vision_extractor() is not None,
+        vision_enabled=vision_extractor is not None,
+        discard_text_layer=text_layer_rejected,
     )
 
     if progress_callback:
@@ -179,6 +197,7 @@ async def process_judgment_file(
         documents=merged_documents,
         pdf_path=pdf_path,
         pdf_profile=pdf_profile,
+        vision_extractor=vision_extractor,
     )
     record_stage(
         "vision_fallback",
@@ -205,9 +224,13 @@ async def process_judgment_file(
             repository.find_near_duplicate_candidates(user_id, candidate_metadata, exclude_record_id=record_id),
         )
     )
-    if pdf_profile.get("profile_type") != "digital" and "ocr_review_required" not in review_package.risk_flags:
+    vision_ocr_succeeded = (
+        str(source_metadata.get("ocr_routing") or "").startswith("vision_ocr")
+        and bool(review_package.source_metadata.get("vision_fallback_used"))
+    )
+    if pdf_profile.get("profile_type") != "digital" and not vision_ocr_succeeded and "ocr_review_required" not in review_package.risk_flags:
         review_package.risk_flags.append("ocr_review_required")
-    if ocr_status.get("needs_ocr") and not ocr_status.get("ocr_available") and "ocr_unavailable" not in review_package.risk_flags:
+    if ocr_status.get("needs_ocr") and not ocr_status.get("ocr_available") and not vision_ocr_succeeded and "ocr_unavailable" not in review_package.risk_flags:
         review_package.risk_flags.append("ocr_unavailable")
     source_metadata["llm_used"] = False
     review_package.source_metadata["llm_used"] = False
@@ -338,8 +361,9 @@ def _prepare_review_documents(
     source_metadata: dict[str, Any],
     pdf_profile: dict[str, Any],
     vision_enabled: bool,
+    discard_text_layer: bool = False,
 ) -> list[Document]:
-    merged_documents = list(documents) + list(table_documents)
+    merged_documents = [] if discard_text_layer else list(documents) + list(table_documents)
     if ocr_documents:
         merged_documents.extend(ocr_documents)
 
@@ -354,6 +378,7 @@ def _prepare_review_documents(
                     "page": 1,
                     "chunk_id": "vision-placeholder-p1",
                     "source_quality": "vision_only",
+                    "extraction_method": "vision_ocr",
                     "profile_type": pdf_profile.get("profile_type"),
                 },
             )

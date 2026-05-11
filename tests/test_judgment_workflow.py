@@ -703,11 +703,12 @@ def test_configured_vision_extractor_supports_ollama(monkeypatch):
 
     monkeypatch.setenv("JUDGMENT_VISION_FALLBACK", "1")
     monkeypatch.setenv("JUDGMENT_VISION_PROVIDER", "ollama")
-    monkeypatch.setenv("OLLAMA_VISION_MODEL", "openbmb/minicpm-o2.6")
+    monkeypatch.setenv("OLLAMA_VISION_MODEL", "openbmb/minicpm-o2.6:latest")
 
     extractor = get_configured_vision_extractor()
 
     assert isinstance(extractor, OllamaVisionExtractor)
+    assert extractor.model == "openbmb/minicpm-o2.6:latest"
 
 
 def test_configured_vision_extractor_supports_lmstudio(monkeypatch):
@@ -2548,6 +2549,106 @@ def test_process_judgment_file_reuses_ocr_detection_for_profile(monkeypatch, wor
     assert calls["detect"] == 1
     assert record["pdf_profile"]["profile_type"] == "digital"
     assert record["pdf_profile"]["total_text_chars"] == 180
+
+
+def test_detect_ocr_need_flags_corrupted_embedded_text(workspace_tmp_path: Path):
+    from judgment_workflow.ocr import detect_ocr_need
+
+    pdf_path = workspace_tmp_path / "corrupted-text-layer.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text(
+        (72, 72),
+        "0 IN tat n0R00PS CF KLNa2dAAtbA:i3L.CLL "
+        "wP.no lqj qj1997 c/w :: ; ;: ee ee "
+        "By thls Ccurt ar the respondents 1 and 2",
+    )
+    doc.save(pdf_path)
+    doc.close()
+
+    result = detect_ocr_need(str(pdf_path), min_text_chars_per_page=20)
+
+    assert result["needs_ocr"] is True
+    assert result["text_layer_reliable"] is False
+    assert result["unreliable_text_pages"] == [1]
+
+
+def test_process_judgment_file_uses_minicpm_vision_ocr_only_for_corrupted_text_layer(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+    from judgment_workflow.vision_extraction import VisionExtractionResult
+
+    def fake_detect_ocr_need(pdf_path):
+        return {
+            "needs_ocr": True,
+            "page_count": 1,
+            "sparse_pages": [],
+            "unreliable_text_pages": [1],
+            "total_text_chars": 140,
+            "text_layer_reliable": False,
+            "ocr_available": True,
+        }
+
+    class FakeMiniCPMExtractor:
+        model = "openbmb/minicpm-o2.6:latest"
+
+        async def extract(self, *, pdf_path, pages, deterministic_summary):
+            assert pages == [1]
+            return VisionExtractionResult(
+                fields={
+                    "case_number": "Writ Petition No. 1234 of 2025",
+                    "court": "High Court of Karnataka at Bengaluru",
+                },
+                directions=["The BBMP is directed to remove the encroachment within four weeks."],
+                evidence_pages={"case_number": 1, "court": 1, "directions": 1},
+                raw_json={"provider": "fake-minicpm"},
+                provider="ollama_minicpm",
+            )
+
+    bad_text_documents = [
+        Document(
+            page_content="0 IN tat n0R00PS CF KLNa2dAAtbA:i3L.CLL wP.no lqj qj1997",
+            metadata={"source": "source.pdf", "page": 1, "chunk_id": "bad-p1"},
+        )
+    ]
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "ocr-only-routing.db"))
+    )
+    asyncio.run(storage.initialize())
+
+    monkeypatch.setattr(judgment_pipeline, "JUDGMENT_DATA_ROOT", workspace_tmp_path / "judgments")
+    monkeypatch.setattr(judgment_pipeline, "compute_document_hash", lambda pdf_path: "hash-ocr-only-routing")
+    monkeypatch.setattr(judgment_pipeline, "detect_ocr_need", fake_detect_ocr_need)
+    monkeypatch.setattr(judgment_pipeline, "extract_layered_pdf_documents", lambda pdf_path: bad_text_documents)
+    monkeypatch.setattr(judgment_pipeline, "ocr_pdf_with_tesseract", lambda pdf_path, target_pages=None: pytest.fail("Tesseract OCR should not run for corrupted text-layer PDFs"))
+    monkeypatch.setattr(judgment_pipeline, "get_configured_vision_extractor", lambda **kwargs: FakeMiniCPMExtractor())
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(workspace_tmp_path / "source.pdf"),
+                record_id="record-ocr-only-routing",
+                original_file_name="source.pdf",
+                source_metadata={"source_system": "test"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                llm_enabled=False,
+                processing_mode="test",
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    assert record["source_metadata"]["text_layer_rejected"] is True
+    assert record["source_metadata"]["ocr_routing"] == "vision_ocr_only"
+    assert record["source_metadata"]["vision_ocr_model"] == "openbmb/minicpm-o2.6:latest"
+    assert record["pdf_profile"]["profile_type"] == "ocr_required"
+    assert record["extraction"]["case_number"]["value"] == "Writ Petition No. 1234 of 2025"
+    assert record["processing_metrics"]["extraction_methods"] == {"vision_ocr": 1}
+    assert "ocr_review_required" not in record["risk_flags"]
+    assert "ocr_unavailable" not in record["risk_flags"]
 
 
 def test_judgment_evidence_index_retrieves_and_reranks_legal_evidence():

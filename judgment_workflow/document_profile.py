@@ -26,8 +26,11 @@ def profile_from_ocr_status(pdf_path: str, ocr_status: dict[str, Any]) -> dict[s
     page_count = int(ocr_status.get("page_count", 0) or 0)
     sparse_pages = list(ocr_status.get("sparse_pages", []))
     total_chars = int(ocr_status.get("total_text_chars", 0) or 0)
+    text_layer_reliable = bool(ocr_status.get("text_layer_reliable", True))
     sparse_ratio = (len(sparse_pages) / page_count) if page_count else 1.0
-    if total_chars == 0:
+    if not text_layer_reliable:
+        profile_type = "ocr_required"
+    elif total_chars == 0:
         profile_type = "scanned"
     elif sparse_ratio >= 0.5:
         profile_type = "mixed"
@@ -41,6 +44,10 @@ def profile_from_ocr_status(pdf_path: str, ocr_status: dict[str, Any]) -> dict[s
         "page_count": page_count,
         "total_text_chars": total_chars,
         "sparse_pages": sparse_pages,
+        "unreliable_text_pages": list(ocr_status.get("unreliable_text_pages", [])),
+        "image_pages": list(ocr_status.get("image_pages", [])),
+        "text_layer_reliable": text_layer_reliable,
+        "page_text_quality": dict(ocr_status.get("page_text_quality", {})),
         "ocr_available": bool(ocr_status.get("ocr_available")),
         "ocr_used": False,
         "source_quality": "text" if profile_type == "digital" else "mixed",

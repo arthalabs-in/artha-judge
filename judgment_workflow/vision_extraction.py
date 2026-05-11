@@ -193,7 +193,7 @@ class OllamaVisionExtractor:
         self,
         *,
         endpoint: str = "http://127.0.0.1:11434/api/chat",
-        model: str = "openbmb/minicpm-o2.6",
+        model: str = "openbmb/minicpm-o2.6:latest",
         timeout_sec: int = 120,
     ) -> None:
         self.endpoint = endpoint
@@ -271,8 +271,13 @@ def _post_json_sync(endpoint: str, payload: dict[str, Any], timeout_sec: int) ->
         return json.loads(response.read().decode("utf-8"))
 
 
-def get_configured_vision_extractor() -> VisionExtractor | None:
+def get_configured_vision_extractor(*, force_ollama: bool = False) -> VisionExtractor | None:
     if os.getenv("JUDGMENT_VISION_FALLBACK", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        if force_ollama:
+            endpoint = os.getenv("OLLAMA_VISION_ENDPOINT", "http://127.0.0.1:11434/api/chat").strip()
+            model = os.getenv("OLLAMA_VISION_MODEL", "openbmb/minicpm-o2.6:latest").strip()
+            timeout = int(os.getenv("JUDGMENT_VISION_TIMEOUT_SEC", "120") or "120")
+            return OllamaVisionExtractor(endpoint=endpoint, model=model, timeout_sec=timeout)
         return None
     provider = os.getenv("JUDGMENT_VISION_PROVIDER", "minicpm").strip().lower()
     if provider in {"minicpm_gguf", "gguf", "llama_cpp"}:
@@ -290,7 +295,7 @@ def get_configured_vision_extractor() -> VisionExtractor | None:
         )
     if provider == "ollama":
         endpoint = os.getenv("OLLAMA_VISION_ENDPOINT", "http://127.0.0.1:11434/api/chat").strip()
-        model = os.getenv("OLLAMA_VISION_MODEL", "openbmb/minicpm-o2.6").strip()
+        model = os.getenv("OLLAMA_VISION_MODEL", "openbmb/minicpm-o2.6:latest").strip()
         timeout = int(os.getenv("JUDGMENT_VISION_TIMEOUT_SEC", "120") or "120")
         return OllamaVisionExtractor(endpoint=endpoint, model=model, timeout_sec=timeout)
     if provider == "lmstudio":

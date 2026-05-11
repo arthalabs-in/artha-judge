@@ -69,7 +69,7 @@ Use `POST /judgments/demo-seed?user_id=demo-user` or the UI button to create a d
 
 ## OCR Note
 
-Digital PDFs are parsed directly. Low-text or scanned PDFs are profiled and flagged. If Tesseract is installed, sparse pages can be OCRed; if not, the record is still reviewable and marked with OCR risk flags.
+Digital PDFs are parsed directly when the embedded text layer is reliable. Low-text, scanned, or corrupted text-layer PDFs are profiled and routed through local MiniCPM vision OCR via Ollama (`openbmb/minicpm-o2.6:latest`) when OCR is needed; corrupted embedded text is discarded instead of being trusted.
 
 ## Evaluation Harness
 
