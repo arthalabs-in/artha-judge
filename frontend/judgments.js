@@ -392,6 +392,10 @@ function renderField(fieldKey, field) {
                 </select>
                 <select data-field-reason>${reviewReasonOptions(field.reason || "")}</select>
             </div>
+            <label class="manual-override-row">
+                <input type="checkbox" data-field-manual-override ${field.manual_override ? "checked" : ""}>
+                <span>Manual override</span>
+            </label>
             <div class="evidence ${evidence ? "" : "missing-evidence"}">${escapeHtml(evidenceText)}</div>
             <div class="field-provenance ${evidence ? "" : "missing-evidence"}">${escapeHtml(citation)}</div>
             ${renderEvidenceList(evidenceItems)}
@@ -460,6 +464,12 @@ function renderAction(action, index = 0) {
                             <input data-prop="reason" placeholder="Add reviewer note or reason" value="${escapeHtml(action.reason || "")}">
                             <span data-edit-icon aria-hidden="true">✎</span>
                         </span>
+                    </span>
+                    <span class="source-proof-note">
+                        <label class="manual-override-row">
+                            <input type="checkbox" data-prop="manual_override" ${action.manual_override ? "checked" : ""}>
+                            <span>Manual override</span>
+                        </label>
                     </span>
                 </label>
             </div>
@@ -678,13 +688,13 @@ function collectReviewPayload(decision) {
             value: card.querySelector("[data-field-value]").value,
             status: card.querySelector("[data-field-status]").value,
             reason: card.querySelector("[data-field-reason]").value,
-            manual_override: card.querySelector("[data-field-status]").value === "manually_entered",
+            manual_override: card.querySelector("[data-field-manual-override]").checked,
         };
     });
     const actionUpdates = Array.from(document.querySelectorAll(".action-card")).map((card) => {
         const update = { action_id: card.dataset.actionId };
         card.querySelectorAll("[data-prop]").forEach((input) => {
-            update[input.dataset.prop] = input.value;
+            update[input.dataset.prop] = input.type === "checkbox" ? input.checked : input.value;
         });
         if (decision === "reject") update.status = "rejected";
         if (decision === "approve" && !update.status) update.status = "approved";

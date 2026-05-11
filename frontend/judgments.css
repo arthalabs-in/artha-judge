@@ -1343,6 +1343,21 @@ body:has(.review-pane.open)::before {
     text-overflow: clip;
 }
 
+.manual-override-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: #5f4522;
+    font-size: 0.78rem;
+    font-weight: 800;
+}
+
+.manual-override-row input {
+    width: 16px;
+    height: 16px;
+    accent-color: #186f65;
+}
+
 .field-provenance {
     justify-self: start;
     max-width: 210px;

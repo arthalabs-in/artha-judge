@@ -33,7 +33,8 @@ DEPARTMENT_PATTERN = re.compile(
 
 OPERATIVE_MARKER_RE = re.compile(
     r"\b(?:we\s+(?:direct|order|allow|dismiss|dispose)|"
-    r"(?:is|are)\s+directed\s+to|ordered\s+to|shall\s+(?:file|pay|release|reconsider|issue|remove|update|comply)|"
+    r"(?:is|are)\s+directed\s+to|ordered\s+to|"
+    r"shall\s+(?:file|pay|release|reconsider|issue|remove|update|comply|provide|communicate|forward|send|retotal|re-total)|"
     r"writ\s+petition\s+is\s+(?:allowed|dismissed|disposed)|petition\s+is\s+(?:allowed|dismissed|disposed))\b",
     re.I,
 )

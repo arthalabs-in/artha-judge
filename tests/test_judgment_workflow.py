@@ -2626,6 +2626,36 @@ def test_evaluate_endpoint_returns_clean_review_schema(monkeypatch, workspace_tm
     assert "record" not in payload
 
 
+def test_upload_endpoint_sanitizes_user_id_before_writing_pdf(monkeypatch, workspace_tmp_path):
+    from judgment_workflow import api as judgment_api
+    from judgment_workflow.api import judgment_router
+
+    data_root = workspace_tmp_path / "judgment_data"
+    captured = {}
+
+    async def fake_process_judgment_file(**kwargs):
+        captured.update(kwargs)
+        return {"record_id": kwargs["record_id"], "user_id": kwargs["user_id"]}
+
+    monkeypatch.setattr(judgment_api, "JUDGMENT_DATA_ROOT", data_root)
+    monkeypatch.setattr(judgment_api, "process_judgment_file", fake_process_judgment_file)
+    monkeypatch.setattr(judgment_api, "get_storage", lambda: None)
+
+    app = FastAPI()
+    app.include_router(judgment_router)
+    client = TestClient(app)
+
+    response = client.post(
+        "/judgments/upload?sync=true",
+        data={"user_id": "../demo reviewer"},
+        files={"file": ("sample.pdf", b"%PDF-1.4\n%", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert captured["user_id"] == "demo_reviewer"
+    assert Path(captured["pdf_path"]).resolve().is_relative_to(data_root.resolve())
+
+
 def test_upload_progress_endpoint_reports_real_pipeline_stages(monkeypatch):
     from judgment_workflow import api as judgment_api
     from judgment_workflow.api import judgment_router

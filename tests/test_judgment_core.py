@@ -718,6 +718,49 @@ def test_tag_connected_appeal_uses_registry_owner_not_party():
     assert resolved.timeline.timeline_type == "not_specified"
 
 
+def test_chhattisgarh_style_header_extracts_standalone_bench_and_respondents():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "NAFR\n"
+                    "HIGH COURT OF CHHATTISGARH AT BILASPUR\n"
+                    "MAC No. 1227 of 2016\n"
+                    "Cholamandalam MS General Insurance Company Limited\n"
+                    "---- Appellant\n"
+                    "Versus\n"
+                    "Smt. Shanti Bai and others\n"
+                    "---- Respondents\n"
+                    "Hon'ble Shri Justice Sanjay Kumar Jaiswal\n"
+                    "Judgment on Board\n"
+                ),
+                metadata={"source": "judgment.pdf", "page": 3, "chunk_id": "p3"},
+            )
+        ]
+    )
+
+    assert package.extraction.bench.value == ["Justice Sanjay Kumar Jaiswal"]
+    assert package.extraction.respondents.value == ["Smt. Shanti Bai"]
+
+
+def test_future_facing_provide_direction_becomes_action_item():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "In future, the High Court shall provide question papers in "
+                    "Kannada and English to all candidates appearing for the examination."
+                ),
+                metadata={"source": "judgment.pdf", "page": 32, "chunk_id": "p32"},
+            )
+        ]
+    )
+
+    assert package.extraction.directions
+    assert package.action_items[0].title == "Provide question papers in Kannada and English to all candidates appearing for the examination"
+    assert package.action_items[0].responsible_department == "High Court"
+
+
 def test_review_decision_edit_approves_package_and_dashboard_projection():
     package = build_judgment_review_package(_sample_documents())
     edited_first_action = package.action_items[0]

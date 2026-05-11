@@ -158,6 +158,8 @@ def _bench_entries_from_text(text: str) -> list[tuple[str, str, float]]:
     entries: list[tuple[str, str, float]] = []
     for judge, raw_text in _bench_from_header_blocks(text):
         entries.append((judge, raw_text, 0.82))
+    for judge, raw_text in _bench_from_standalone_lines(text):
+        entries.append((judge, raw_text, 0.82))
     for judge, raw_text in _bench_from_law_report_headers(text):
         entries.append((judge, raw_text, 0.76))
     for judge, raw_text in _bench_from_signature_block(text):
@@ -171,6 +173,26 @@ def _bench_entries_from_text(text: str) -> list[tuple[str, str, float]]:
         seen.add(key)
         deduped.append((judge, raw_text, confidence))
     return deduped
+
+
+def _bench_from_standalone_lines(text: str) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    pattern = re.compile(
+        r"\bHON'?BLE\s+(?:SHRI|SMT\.?|MR\.?|MS\.?|MRS\.?)?\s*JUSTICE\s+"
+        r"(?P<name>[A-Z][A-Za-z .'-]{2,80})\b",
+        re.I,
+    )
+    for line in text.splitlines()[:160]:
+        clean = _clean_line(line)
+        if not clean or re.search(r"\b(?:for\s+(?:petitioner|appellant|respondent)|counsel|advocate)\b", clean, re.I):
+            continue
+        match = pattern.search(clean)
+        if not match:
+            continue
+        name = _normalise_person_name(match.group("name"))
+        if name and _looks_like_judge_signature_name(name):
+            entries.append((f"Justice {name}", clean))
+    return entries
 
 
 def _bench_from_header_blocks(text: str) -> list[tuple[str, str]]:
@@ -426,7 +448,7 @@ def _judge_names_from_header_text(text: str) -> list[str]:
     names: list[str] = []
     pattern = re.compile(
         r"(?:HON'?BLE\s+)?(?:(?:MR|MS|MRS)\.?\s+)?(?:(?P<chief>CHIEF\s+JUSTICE)|JUSTICE)\s+"
-        r"(?P<name>[A-Z][A-Z .'-]{1,80})(?=\s+(?:HON'?BLE|JUSTICE|CHIEF\s+JUSTICE)|$)",
+        r"(?P<name>[A-Z][A-Z .'-]{1,80}?)(?=\s+(?:HON'?BLE(?:\s+(?:MR|MS|MRS)\.?)?\s+JUSTICE|JUSTICE|CHIEF\s+JUSTICE)|$)",
         re.I,
     )
     for match in pattern.finditer(" ".join(text.split())):
@@ -1054,10 +1076,22 @@ def _line_based_parties(text: str) -> tuple[list[str], list[str], str] | None:
         if same_line:
             return _split_parties(same_line.group("left")), _split_parties(same_line.group("right")), line
         if re.fullmatch(r"(?:v\.?|vs\.?|versus)", line, re.I) and index > 0 and index + 1 < len(lines):
-            left = lines[index - 1]
-            right = lines[index + 1]
+            left = _nearest_party_caption_line(lines, index - 1, -1)
+            right = _nearest_party_caption_line(lines, index + 1, 1)
+            if not left or not right:
+                continue
             raw = f"{left} VERSUS {right}"
             return _split_parties(left), _split_parties(right), raw
+    return None
+
+
+def _nearest_party_caption_line(lines: list[str], start: int, step: int) -> str | None:
+    index = start
+    while 0 <= index < len(lines):
+        line = lines[index]
+        if not re.fullmatch(r"[-–—. ]*(?:Petitioner|Respondent|Appellant|Applicant|Claimant)s?[-–—. ()]*", line, re.I):
+            return line
+        index += step
     return None
 
 
