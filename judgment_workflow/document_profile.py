@@ -19,6 +19,10 @@ def compute_document_hash(pdf_path: str) -> str:
 
 def profile_pdf(pdf_path: str) -> dict[str, Any]:
     ocr_status = detect_ocr_need(pdf_path)
+    return profile_from_ocr_status(pdf_path, ocr_status)
+
+
+def profile_from_ocr_status(pdf_path: str, ocr_status: dict[str, Any]) -> dict[str, Any]:
     page_count = int(ocr_status.get("page_count", 0) or 0)
     sparse_pages = list(ocr_status.get("sparse_pages", []))
     total_chars = int(ocr_status.get("total_text_chars", 0) or 0)

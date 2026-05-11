@@ -13,11 +13,10 @@ from rag.judgment.owner_resolution import apply_inferred_action_owner
 
 from .config import JUDGMENT_DATA_ROOT
 from .document_layers import extract_layered_pdf_documents, metadata_for_metrics
-from .document_profile import compute_document_hash, profile_pdf
+from .document_profile import compute_document_hash, profile_from_ocr_status
 from .llm_extractor import enrich_review_package_with_llm
 from .llm_review_workflow import build_llm_first_review_package
 from .ocr import detect_ocr_need, ocr_pdf_with_tesseract
-from .pdf_highlights import generate_highlighted_pdf
 from .repository import JudgmentRepository
 from .vision_extraction import (
     get_configured_vision_extractor,
@@ -76,7 +75,6 @@ async def process_judgment_file(
         progress_callback(stage="judgment_processing", message="Extracting judgment content...", pct=15.0)
 
     hash_task = asyncio.create_task(timed_to_thread("document_hash", compute_document_hash, pdf_path))
-    profile_task = asyncio.create_task(timed_to_thread("pdf_profile", profile_pdf, pdf_path))
     ocr_detection_task = asyncio.create_task(timed_to_thread("ocr_detection", detect_ocr_need, pdf_path))
     if embedding_model is None:
         extraction_task = asyncio.create_task(
@@ -113,12 +111,14 @@ async def process_judgment_file(
             repository.find_duplicate_candidates(user_id, document_hash, exclude_record_id=record_id),
         )
     )
-    pdf_profile, ocr_status, extraction_result, duplicate_candidates = await asyncio.gather(
-        profile_task,
+    ocr_status, extraction_result, duplicate_candidates = await asyncio.gather(
         ocr_detection_task,
         extraction_task,
         duplicate_task,
     )
+    stage_started_at = perf_counter()
+    pdf_profile = profile_from_ocr_status(pdf_path, ocr_status)
+    record_stage("pdf_profile", stage_started_at)
     if duplicate_candidates:
         source_metadata["duplicate_warning"] = True
     if embedding_model is None:
@@ -226,18 +226,13 @@ async def process_judgment_file(
     highlighted_pdf_path = str(record_root / "highlighted.pdf")
 
     if progress_callback:
-        progress_callback(stage="highlight_generation", message="Generating highlighted PDF...", pct=75.0)
+        progress_callback(stage="highlight_generation", message="Preparing source proof viewer...", pct=75.0)
 
-    highlight_task = asyncio.create_task(
-        timed_to_thread(
-            "highlight_generation",
-            generate_highlighted_pdf,
-            original_pdf_path=pdf_path,
-            output_pdf_path=highlighted_pdf_path,
-            review_package_or_record=review_package,
-        )
-    )
-    near_duplicate_candidates, _ = await asyncio.gather(near_duplicate_task, highlight_task)
+    source_metadata["highlight_generation_mode"] = "deferred"
+    review_package.source_metadata["highlight_generation_mode"] = "deferred"
+    stage_started_at = perf_counter()
+    record_stage("highlight_deferred", stage_started_at)
+    near_duplicate_candidates = await near_duplicate_task
     duplicate_candidates = _merge_duplicate_candidates(duplicate_candidates, near_duplicate_candidates)
     if duplicate_candidates and "possible_duplicate" not in review_package.risk_flags:
         review_package.risk_flags.append("possible_duplicate")

@@ -2391,6 +2391,165 @@ def test_generate_highlighted_pdf_is_standalone(workspace_tmp_path: Path):
         highlighted_doc.close()
 
 
+def test_highlighted_page_endpoint_generates_deferred_pdf(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import api as judgment_api
+    from judgment_workflow.api import judgment_router
+
+    source_pdf = workspace_tmp_path / "source-lazy.pdf"
+    highlighted_pdf = workspace_tmp_path / "records" / "record-lazy" / "highlighted.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "The BBMP is directed to remove the encroachment within four weeks.")
+    doc.save(source_pdf)
+    doc.close()
+
+    record = {
+        "record_id": "record-lazy",
+        "user_id": "reviewer",
+        "original_pdf_path": str(source_pdf),
+        "highlighted_pdf_path": str(highlighted_pdf),
+        "pdf_profile": {"page_count": 1},
+        "extraction": {
+            "directions": [
+                {
+                    "evidence": [
+                        {
+                            "page": 1,
+                            "snippet": "BBMP is directed to remove the encroachment",
+                            "extraction_method": "deterministic",
+                        }
+                    ]
+                }
+            ]
+        },
+        "action_items": [],
+    }
+    metadata_updates = []
+
+    class FakeRepository:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get_record(self, user_id, record_id):
+            assert user_id == "reviewer"
+            assert record_id == "record-lazy"
+            return record
+
+        async def update_record_metadata(self, user_id, record_id, **kwargs):
+            metadata_updates.append(kwargs)
+            record.update(kwargs)
+
+    monkeypatch.setattr(judgment_api, "JudgmentRepository", FakeRepository)
+    monkeypatch.setattr(judgment_api, "get_storage", lambda: None)
+
+    app = FastAPI()
+    app.include_router(judgment_router)
+    client = TestClient(app)
+
+    response = client.get("/judgments/record-lazy/highlighted-page/1?user_id=reviewer")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\x89PNG")
+    assert highlighted_pdf.exists()
+    assert metadata_updates == [{"highlighted_pdf_path": str(highlighted_pdf)}]
+
+
+def test_process_judgment_file_defers_highlight_generation(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+
+    source_pdf = workspace_tmp_path / "source-deferred.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text(
+        (72, 72),
+        "IN THE HIGH COURT OF KARNATAKA AT BENGALURU. "
+        "Writ Petition No. 1234 of 2025. "
+        "The BBMP is directed to remove the encroachment within four weeks.",
+    )
+    doc.save(source_pdf)
+    doc.close()
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "deferred.db"))
+    )
+    asyncio.run(storage.initialize())
+
+    monkeypatch.setattr(judgment_pipeline, "JUDGMENT_DATA_ROOT", workspace_tmp_path / "judgments")
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(source_pdf),
+                record_id="record-deferred",
+                original_file_name=source_pdf.name,
+                source_metadata={"source_system": "test"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                llm_enabled=False,
+                processing_mode="test",
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    highlighted_path = Path(record["highlighted_pdf_path"])
+    assert highlighted_path.name == "highlighted.pdf"
+    assert not highlighted_path.exists()
+    assert record["source_metadata"]["highlight_generation_mode"] == "deferred"
+
+
+def test_process_judgment_file_reuses_ocr_detection_for_profile(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import document_profile, pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+
+    calls = {"detect": 0}
+
+    def fake_detect_ocr_need(pdf_path):
+        calls["detect"] += 1
+        return {
+            "needs_ocr": False,
+            "page_count": 2,
+            "sparse_pages": [],
+            "total_text_chars": 180,
+            "ocr_available": False,
+        }
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "single-profile-pass.db"))
+    )
+    asyncio.run(storage.initialize())
+
+    monkeypatch.setattr(judgment_pipeline, "JUDGMENT_DATA_ROOT", workspace_tmp_path / "judgments")
+    monkeypatch.setattr(judgment_pipeline, "compute_document_hash", lambda pdf_path: "hash-single-pass")
+    monkeypatch.setattr(judgment_pipeline, "extract_layered_pdf_documents", lambda pdf_path: _sample_documents())
+    monkeypatch.setattr(judgment_pipeline, "detect_ocr_need", fake_detect_ocr_need)
+    monkeypatch.setattr(document_profile, "detect_ocr_need", fake_detect_ocr_need)
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(workspace_tmp_path / "source.pdf"),
+                record_id="record-single-profile-pass",
+                original_file_name="source.pdf",
+                source_metadata={"source_system": "test"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                llm_enabled=False,
+                processing_mode="test",
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    assert calls["detect"] == 1
+    assert record["pdf_profile"]["profile_type"] == "digital"
+    assert record["pdf_profile"]["total_text_chars"] == 180
+
+
 def test_judgment_evidence_index_retrieves_and_reranks_legal_evidence():
     from rag.judgment.retrieval import JudgmentEvidenceIndex
 
