@@ -658,6 +658,21 @@ def test_vision_payload_parser_combines_action_description_and_accepts_fuzzy_rol
     assert result.evidence_pages["directions"] == 3
 
 
+def test_vision_prompt_uses_llm_extractor_schema():
+    from judgment_workflow.vision_extraction import _vision_prompt
+
+    prompt = _vision_prompt({"case_number": None}, [1, 2, 4])
+
+    assert '"case_type": null' in prompt
+    assert '"date_of_order": {"value": null' in prompt
+    assert '"parties_involved": {"petitioners": []' in prompt
+    assert '"key_directions_orders": [{"text": "...", "confidence": 0.0' in prompt
+    assert '"relevant_timelines": [{"text": "...", "confidence": 0.0' in prompt
+    assert '"verbatim_final_order_excerpt": null' in prompt
+    assert "An ORDER heading or 'made the following' sentence is not an operative direction by itself" in prompt
+    assert "same schema used by the text/LLM extractor" in prompt
+
+
 def test_vision_result_merge_overwrites_empty_primary_values():
     from judgment_workflow.vision_extraction import VisionExtractionResult, _merge_vision_result
 
@@ -682,6 +697,104 @@ def test_vision_payload_parser_rejects_incomplete_case_number_labels():
     result = result_from_vision_payload({"case_details": {"case_number": "WRIT PETITION NO."}})
 
     assert "case_number" not in result.fields
+
+
+def test_vision_payload_parser_does_not_treat_observed_judge_entity_as_department():
+    from judgment_workflow.vision_extraction import result_from_vision_payload
+
+    result = result_from_vision_payload(
+        {
+            "case_details": {
+                "case_number": "CIVIL REVISION PETITION NO.2982/1997",
+                "court": "High Court of Karnataka at Bangalore",
+                "responsible_entities": ["The Hon'ble Mr. Justice Y.Bhaskar Rao"],
+                "advocates": [{"name": "Sri T.Narayanaswamy, Adv.", "role": "Petitioner's Advocate"}],
+            },
+            "parties_involved": {
+                "petitioners": [{"name": "K.Nissar Ahmed"}],
+                "respondents": [{"name": "M/s.Karnataka Agro Industries Corp.Ltd."}],
+            },
+        }
+    )
+
+    assert "departments" not in result.fields
+    assert result.fields["advocates"] == ["Sri T.Narayanaswamy, Adv."]
+
+
+def test_vision_payload_parser_rejects_standalone_order_heading_as_direction():
+    from judgment_workflow.vision_extraction import result_from_vision_payload
+
+    result = result_from_vision_payload({"key_directions_orders": [{"text": "ORDER"}]})
+
+    assert result.directions == []
+
+
+def test_vision_payload_parser_keeps_respondent_organization_and_filters_advocate_roles():
+    from judgment_workflow.vision_extraction import result_from_vision_payload
+
+    result = result_from_vision_payload(
+        {
+            "case_details": {
+                "advocates": [
+                    {"name": "Sri.T.Narayanaswamy, Adv.", "role": "Petitioner"},
+                    {
+                        "name": "General Manager (P) and Secretary",
+                        "organization": "M/s.Karnataka Agro Industries Corp.Ltd.",
+                        "role": "Respondent",
+                    },
+                ]
+            },
+            "parties_involved": {
+                "petitioners": [{"name": "K.Nissar Ahmed"}],
+                "respondents": [{"organization": "M/s.Karnataka Agro Industries Corp.Ltd."}],
+            },
+        }
+    )
+
+    assert result.fields["advocates"] == ["Sri.T.Narayanaswamy, Adv."]
+    assert result.fields["respondents"] == ["M/s.Karnataka Agro Industries Corp.Ltd."]
+
+
+def test_vision_field_repair_targets_missing_bench_from_observed_wp16426_output():
+    from judgment_workflow.vision_extraction import _vision_fields_needing_repair, result_from_vision_payload
+
+    result = result_from_vision_payload(
+        {
+            "case_details": {
+                "case_number": "W.P.16426/96",
+                "case_type": "Civil Writ Petition",
+                "court": "High Court of Karnataka at Bangalore",
+                "bench": [],
+                "departments": [],
+                "responsible_entities": [],
+                "advocates": [
+                    {"name": "Smt Suman Hegde, Adv.", "role": "Petitioner"},
+                    {"name": "Sri N.S. Venugopal, Adv", "role": "Respondent"},
+                ],
+                "disposition": None,
+            },
+            "date_of_order": {"value": "18th June 1998", "raw_text": "DATED THIS THE 18TH DAY OF JUNE 1998"},
+            "parties_involved": {
+                "petitioners": [{"name": "Sufala Devidas Rane"}],
+                "respondents": [{"name": "Deputy Director, Department of Public Education, Karwar (U.K), Zilla Parishad"}],
+            },
+        }
+    )
+
+    assert _vision_fields_needing_repair(result) == ["bench"]
+
+
+def test_vision_field_repair_prompt_is_single_field_and_schema_bound():
+    from judgment_workflow.vision_extraction import _vision_field_repair_prompt
+
+    prompt = _vision_field_repair_prompt("bench", [1, 2])
+
+    assert "Repair exactly one missing or weak field: bench" in prompt
+    assert '"field": "bench"' in prompt
+    assert '"value": []' in prompt
+    assert "Do not extract case_number" in prompt
+    assert "BEFORE THE HON'BLE" in prompt
+    assert "G.C.BHARUKA" not in prompt
 
 
 def test_configured_vision_extractor_supports_minicpm_gguf(monkeypatch):
@@ -2649,6 +2762,99 @@ def test_process_judgment_file_uses_minicpm_vision_ocr_only_for_corrupted_text_l
     assert record["processing_metrics"]["extraction_methods"] == {"vision_ocr": 1}
     assert "ocr_review_required" not in record["risk_flags"]
     assert "ocr_unavailable" not in record["risk_flags"]
+
+
+def test_process_judgment_file_passes_vision_ocr_context_to_llm_for_corrupted_text(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+    from judgment_workflow.vision_extraction import VisionExtractionResult
+
+    def fake_detect_ocr_need(pdf_path):
+        return {
+            "needs_ocr": True,
+            "page_count": 2,
+            "sparse_pages": [],
+            "unreliable_text_pages": [1, 2],
+            "total_text_chars": 240,
+            "text_layer_reliable": False,
+            "ocr_available": False,
+        }
+
+    class FakeMiniCPMExtractor:
+        model = "openbmb/minicpm-o2.6:latest"
+
+        async def extract(self, *, pdf_path, pages, deterministic_summary):
+            assert pages == [1, 2]
+            return VisionExtractionResult(
+                fields={
+                    "case_number": "CIVIL REVISION PETITION NO.2982/1997",
+                    "case_type": "Civil Revision Petition",
+                    "court": "High Court of Karnataka at Bangalore",
+                    "bench": ["Justice Y. Bhaskar Rao"],
+                    "judgment_date": "16TH DAY OF JANUARY, 1998",
+                    "advocates": ["Sri.T.Narayanaswamy, Adv."],
+                },
+                directions=["The petition is dismissed."],
+                evidence_pages={"case_number": 1, "court": 1, "directions": 2},
+                raw_json={
+                    "case_details": {
+                        "case_number": "CIVIL REVISION PETITION NO.2982/1997",
+                        "case_type": "Civil Revision Petition",
+                        "court": "High Court of Karnataka at Bangalore",
+                    },
+                    "date_of_order": {"raw_text": "DATED THE 16TH DAY OF JANUARY, 1998"},
+                    "key_directions_orders": [{"text": "The petition is dismissed.", "source_page": 2}],
+                },
+                provider="ollama_minicpm",
+            )
+
+    bad_text_documents = [
+        Document(
+            page_content="0 IN tat n0R00PS CF KLNa2dAAtbA:i3L.CLL wP.no lqj qj1997",
+            metadata={"source": "source.pdf", "page": 1, "chunk_id": "bad-p1"},
+        )
+    ]
+    llm_seen = {}
+
+    async def fake_build_llm_first_review_package(documents, case_metadata, *, pdf_profile=None, **kwargs):
+        llm_seen["texts"] = [doc.page_content for doc in documents]
+        llm_seen["metadata"] = [dict(doc.metadata or {}) for doc in documents]
+        assert any('"case_details"' in text and "CIVIL REVISION PETITION NO.2982/1997" in text for text in llm_seen["texts"])
+        assert not any("KLNa2dAAtbA" in text for text in llm_seen["texts"])
+        return build_judgment_review_package(documents, case_metadata)
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "vision-to-llm.db"))
+    )
+    asyncio.run(storage.initialize())
+
+    monkeypatch.setattr(judgment_pipeline, "JUDGMENT_DATA_ROOT", workspace_tmp_path / "judgments")
+    monkeypatch.setattr(judgment_pipeline, "compute_document_hash", lambda pdf_path: "hash-vision-to-llm")
+    monkeypatch.setattr(judgment_pipeline, "detect_ocr_need", fake_detect_ocr_need)
+    monkeypatch.setattr(judgment_pipeline, "extract_layered_pdf_documents", lambda pdf_path: bad_text_documents)
+    monkeypatch.setattr(judgment_pipeline, "get_configured_vision_extractor", lambda **kwargs: FakeMiniCPMExtractor())
+    monkeypatch.setattr(judgment_pipeline, "build_llm_first_review_package", fake_build_llm_first_review_package)
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(workspace_tmp_path / "source.pdf"),
+                record_id="record-vision-to-llm",
+                original_file_name="source.pdf",
+                source_metadata={"source_system": "test"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                llm_enabled=True,
+                processing_mode="test",
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    assert llm_seen["metadata"][0]["extraction_method"] == "vision_ocr"
+    assert record["source_metadata"]["ocr_routing"] == "vision_ocr_only"
+    assert record["source_metadata"]["vision_fallback_used"] is True
 
 
 def test_judgment_evidence_index_retrieves_and_reranks_legal_evidence():

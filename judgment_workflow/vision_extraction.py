@@ -23,12 +23,15 @@ from rag.judgment.evidence import normalize_evidence
 
 VISION_FIELD_NAMES = {
     "case_number",
+    "case_type",
     "court",
     "bench",
     "judgment_date",
     "parties",
     "petitioners",
     "respondents",
+    "departments",
+    "advocates",
     "disposition",
 }
 
@@ -252,6 +255,34 @@ class OllamaVisionExtractor:
             repair_parsed = _parse_json_object(repair_content)
             repair_result = result_from_vision_payload(repair_parsed, provider="ollama_minicpm")
             _merge_vision_result(result, repair_result, default_page=pages[0] if pages else 1)
+        for field_name in _vision_fields_needing_repair(result):
+            repair_payload = {
+                "model": self.model,
+                "stream": False,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": _vision_field_repair_prompt(field_name, pages[:2] or pages[:1]),
+                        "images": images[:2] or images[:1],
+                    }
+                ],
+                "options": {
+                    "temperature": 0,
+                    "top_p": 1,
+                    "top_k": 1,
+                    "num_ctx": 4096,
+                },
+            }
+            repair_raw = await _post_json(self.endpoint, repair_payload, timeout_sec=self.timeout_sec)
+            repair_content = _ollama_content(repair_raw)
+            repair_parsed = _parse_json_object(repair_content)
+            repair_result = result_from_vision_payload(
+                _payload_from_field_repair(field_name, repair_parsed),
+                provider="ollama_minicpm",
+            )
+            if repair_result.fields:
+                result.raw_json.setdefault("field_repairs", {})[field_name] = repair_parsed
+                _merge_vision_result(result, repair_result, default_page=pages[0] if pages else 1)
         return result
 
 
@@ -504,9 +535,23 @@ def _valid_vision_direction(direction: Any) -> bool:
 def result_from_vision_payload(payload: dict[str, Any], *, provider: str = "minicpm") -> VisionExtractionResult:
     fields: dict[str, Any] = {}
     case_details = payload.get("case_details") if isinstance(payload.get("case_details"), dict) else payload
-    for field in ("case_number", "court", "bench", "judgment_date", "disposition"):
+    for field in ("case_number", "case_type", "court", "bench", "judgment_date", "disposition", "advocates"):
         if field in case_details and not _vision_field_value_empty(field, case_details[field]):
-            fields[field] = case_details[field]
+            if field == "advocates":
+                fields[field] = _advocate_values(case_details[field])
+            elif field == "bench":
+                fields[field] = _as_list(case_details[field])
+            else:
+                fields[field] = case_details[field]
+    date_payload = payload.get("date_of_order")
+    if isinstance(date_payload, dict) and date_payload.get("value"):
+        fields["judgment_date"] = str(date_payload["value"]).strip()
+    elif isinstance(date_payload, dict) and date_payload.get("raw_text"):
+        fields["judgment_date"] = str(date_payload["raw_text"]).strip()
+    departments = _public_entity_values(case_details.get("departments"))
+    departments.extend(item for item in _public_entity_values(case_details.get("responsible_entities")) if item not in departments)
+    if departments:
+        fields["departments"] = departments
     parties = payload.get("parties") or payload.get("parties_involved") or case_details.get("parties")
     if isinstance(parties, dict):
         if parties.get("petitioners") is not None:
@@ -525,8 +570,10 @@ def result_from_vision_payload(payload: dict[str, Any], *, provider: str = "mini
             if _role_values_consistent_with_parties(role_values, fields.get("parties")):
                 fields[party_field] = role_values
     directions = (
-        payload.get("operative_directions")
+        payload.get("key_directions_orders")
+        or payload.get("operative_directions")
         or payload.get("directions")
+        or case_details.get("key_directions_orders")
         or case_details.get("operative_directions")
         or case_details.get("directions")
     )
@@ -570,14 +617,61 @@ def _as_list(value: Any) -> list[str]:
     return [normalized] if normalized else []
 
 
+def _advocate_values(value: Any) -> list[str]:
+    values = []
+    if isinstance(value, list):
+        for item in value:
+            text = _string_value(item)
+            combined = f"{text} {_string_value((item or {}).get('role')) if isinstance(item, dict) else ''}"
+            if text and _looks_like_advocate(combined):
+                values.append(text)
+        return values
+    text = _string_value(value)
+    return [text] if text and _looks_like_advocate(text) else []
+
+
+def _looks_like_advocate(value: str) -> bool:
+    return bool(re.search(r"\b(?:adv\.?|advocate|counsel|solicitor|attorney|for\s+(?:the\s+)?(?:petitioner|respondent|appellant))\b", value or "", re.I))
+
+
+def _public_entity_values(value: Any) -> list[str]:
+    return [item for item in _as_list(value) if _looks_like_public_entity(item)]
+
+
+def _looks_like_public_entity(value: str) -> bool:
+    text = " ".join(str(value or "").split())
+    lowered = text.lower()
+    if not text:
+        return False
+    if re.search(r"\b(?:hon'?ble|justice|judge|advocate|counsel|petitioner'?s advocate|respondent'?s advocate)\b", lowered):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:state|government|department|commissioner|collector|registrar|registry|court|tribunal|"
+            r"authority|board|corporation|municipal|panchayat|police|secretary|officer|director|"
+            r"committee|council|university|ministry|railway|revenue|tax|customs)\b",
+            lowered,
+        )
+    )
+
+
 def _as_direction_list(value: Any) -> list[str]:
     if value in (None, ""):
         return []
     if not isinstance(value, list):
         normalized = _direction_text(value)
-        return [normalized] if normalized else []
+        return [normalized] if normalized and not _is_direction_heading_only(normalized) else []
     normalized = [_direction_text(item) for item in value]
-    return [item for item in normalized if item]
+    return [item for item in normalized if item and not _is_direction_heading_only(item)]
+
+
+def _is_direction_heading_only(value: str) -> bool:
+    text = " ".join(str(value or "").split()).strip(" .:-")
+    if re.fullmatch(r"(?i)(?:order|judgment|ordered|the\s+following)", text):
+        return True
+    if re.fullmatch(r"(?i).*made\s+the\s+following", text):
+        return True
+    return False
 
 
 def _direction_text(value: Any) -> str:
@@ -597,7 +691,7 @@ def _string_value(value: Any) -> str:
     if value in (None, ""):
         return ""
     if isinstance(value, dict):
-        for key in ("name", "text", "direction", "value", "title", "content"):
+        for key in ("name", "organization", "text", "direction", "value", "title", "content"):
             if value.get(key):
                 return str(value[key]).strip()
         return ""
@@ -674,7 +768,7 @@ def _normalize_evidence_pages(value: Any) -> dict[str, int]:
     }
 
 
-def render_pdf_pages_for_vision(pdf_path: str, pages: list[int], *, zoom: float = 1.6) -> list[str]:
+def render_pdf_pages_for_vision(pdf_path: str, pages: list[int], *, zoom: float = 1.8) -> list[str]:
     rendered: list[str] = []
     matrix = fitz.Matrix(zoom, zoom)
     with fitz.open(pdf_path) as pdf:
@@ -686,7 +780,7 @@ def render_pdf_pages_for_vision(pdf_path: str, pages: list[int], *, zoom: float 
     return rendered
 
 
-def render_pdf_pages_to_files(pdf_path: str, pages: list[int], output_dir: Path, *, zoom: float = 1.6) -> list[tuple[int, Path]]:
+def render_pdf_pages_to_files(pdf_path: str, pages: list[int], output_dir: Path, *, zoom: float = 1.8) -> list[tuple[int, Path]]:
     rendered: list[tuple[int, Path]] = []
     matrix = fitz.Matrix(zoom, zoom)
     with fitz.open(pdf_path) as pdf:
@@ -702,18 +796,31 @@ def render_pdf_pages_to_files(pdf_path: str, pages: list[int], output_dir: Path,
 
 def _vision_prompt(deterministic_summary: dict[str, Any], pages: list[int]) -> str:
     return (
-        "Extract court judgment metadata and final operative directions from the attached rendered PDF pages. "
-        "Use only visible page content. Return strict JSON only, with this exact schema: "
-        "{\"case_details\":{\"case_number\":string|null,\"court\":string|null,\"bench\":string[],"
-        "\"judgment_date\":string|null,\"disposition\":string|null},"
-        "\"parties\":{\"petitioners\":string[],\"respondents\":string[],\"other_parties\":string[]},"
-        "\"operative_directions\":[{\"title\":string,\"text\":string,\"responsible_party\":string|null,"
-        "\"deadline\":string|null,\"source_page\":number|null}],"
-        "\"evidence_pages\":{\"case_number\":number|null,\"court\":number|null,\"bench\":number|null,"
-        "\"judgment_date\":number|null,\"parties\":number|null,\"directions\":number|null},"
-        "\"uncertainties\":string[]}. "
-        "For scanned judgments, read the first pages for metadata and the final pages for the order. "
+        "You are the vision OCR extractor for Artha Judge. Extract the same schema used by the text/LLM extractor "
+        "from the attached rendered PDF pages. Use only visible page content. Return strict JSON only with this shape: "
+        "{\n"
+        '  "case_details": {"case_number": null, "case_type": null, "court": null, "bench": [], '
+        '"departments": [], "responsible_entities": [], "advocates": [], "disposition": null, "evidence_snippet": null},\n'
+        '  "date_of_order": {"value": null, "raw_text": null, "confidence": 0.0, "evidence_snippet": null},\n'
+        '  "parties_involved": {"petitioners": [], "respondents": [], "other_parties": [], "evidence_snippet": null},\n'
+        '  "key_directions_orders": [{"text": "...", "confidence": 0.0, "evidence_snippet": "...", "source_page": null}],\n'
+        '  "relevant_timelines": [{"text": "...", "confidence": 0.0, "evidence_snippet": "..."}],\n'
+        '  "page_notes": [{"page": 1, "readability": "good|moderate|poor", "notes": "..."}],\n'
+        '  "uncertainties": [],\n'
+        '  "verbatim_final_order_excerpt": null,\n'
+        '  "confidence": 0.0\n'
+        "}. "
+        "For scanned judgments, read first pages for metadata and final pages for the operative order. "
         "Do not infer petitioner/respondent roles unless visible labels such as Petitioner, Respondent, Versus, or party captions support them. "
+        "bench must contain judges; do not put judges in departments or responsible_entities. "
+        "departments/responsible_entities must be actual public bodies, authorities, courts, tribunals, registries, or officers visible in the judgment; never include advocates, counsel, judges, or private parties there. "
+        "date_of_order.value should be the normalized judgment/order date if raw_text visibly contains a date. "
+        "For key_directions_orders, capture only final operative orders/directions/outcomes, not prayers, submissions, facts, or lower-court history. "
+        "When an ORDER heading appears, continue reading below it and include the final operative sentence such as dismissed, allowed, quashed, remanded, or disposed. "
+        "An ORDER heading or 'made the following' sentence is not an operative direction by itself; if that is all you can read, put it in uncertainties instead of key_directions_orders. "
+        "verbatim_final_order_excerpt must copy the visible final order sentence when present. "
+        "If the final order only dismisses/allows/disposes with no operational task, return that outcome as a direction with the evidence snippet; do not invent an owner. "
+        "If a value is unclear, return null or [] and explain in uncertainties instead of guessing. "
         f"Rendered page numbers: {pages}. "
         f"Current deterministic extraction hints: {json.dumps(deterministic_summary, default=str)}"
     )
@@ -738,6 +845,63 @@ def _vision_metadata_repair_prompt(pages: list[int]) -> str:
 
 def _needs_metadata_repair(result: VisionExtractionResult) -> bool:
     return any(result.fields.get(field) in (None, "", []) for field in ("case_number", "court"))
+
+
+def _vision_fields_needing_repair(result: VisionExtractionResult) -> list[str]:
+    fields = result.fields or {}
+    repair_fields = []
+    if _vision_field_missing_or_weak("bench", fields.get("bench")):
+        repair_fields.append("bench")
+    return repair_fields
+
+
+def _vision_field_missing_or_weak(field_name: str, value: Any) -> bool:
+    if value in (None, "", []):
+        return True
+    values = _as_list(value)
+    if field_name == "bench":
+        if not values:
+            return True
+        weak_values = {"before", "division bench", "single judge", "hon'ble", "honble"}
+        return all(str(item).strip().lower() in weak_values for item in values)
+    return False
+
+
+def _vision_field_repair_prompt(field_name: str, pages: list[int]) -> str:
+    if field_name == "bench":
+        return (
+            "Repair exactly one missing or weak field: bench.\n"
+            "Read only the attached rendered judgment header/caption pages. Return strict JSON only with this shape:\n"
+            "{\n"
+            '  "field": "bench",\n'
+            '  "value": [],\n'
+            '  "raw_text": null,\n'
+            '  "confidence": 0.0,\n'
+            '  "evidence_snippet": null,\n'
+            '  "uncertainties": []\n'
+            "}\n"
+            "Rules:\n"
+            "- Extract only judge names from visible bench markers such as BEFORE THE HON'BLE, CORAM, PRESENT, or signature lines.\n"
+            "- If the page says BEFORE THE HON'BLE MR.JUSTICE A.B.C., value must be [\"Justice A.B.C.\"].\n"
+            "- Do not return generic labels like BEFORE, Single Judge, Division Bench, Court, or Hon'ble.\n"
+            "- Do not extract case_number, court, date, parties, advocates, directions, or anything except bench.\n"
+            "- If no judge name is visible, return value=[] with low confidence and explain in uncertainties.\n"
+            f"Rendered page numbers: {pages}."
+        )
+    return (
+        f"Repair exactly one missing or weak field: {field_name}. "
+        "Return strict JSON only with field, value, raw_text, confidence, evidence_snippet, and uncertainties."
+    )
+
+
+def _payload_from_field_repair(field_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    value = payload.get("value")
+    if field_name == "bench":
+        return {
+            "case_details": {"bench": value if isinstance(value, list) else _as_list(value)},
+            "evidence_pages": {"bench": payload.get("page") or 1},
+        }
+    return {"case_details": {field_name: value}}
 
 
 def _chat_completion_content(payload: dict[str, Any]) -> str:
