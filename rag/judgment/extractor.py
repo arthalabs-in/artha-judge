@@ -986,9 +986,9 @@ def _extract_directions(extraction: JudgmentExtraction, document: Document, text
 
 def _judgment_sentences(text: str) -> list[str]:
     protected = text
-    for abbreviation in ("C.A.No.", "C.A.", "S.L.P.", "W.P.", "Nos.", "No.", "Mr.", "Ms.", "Dr."):
+    for abbreviation in ("C.A.No.", "C.A.", "S.L.P.", "W.P.", "Nos.", "No.", "Mr.", "Ms.", "Dr.", "Rs."):
         protected = re.sub(
-            re.escape(abbreviation),
+            rf"(?<![A-Za-z]){re.escape(abbreviation)}",
             lambda match: match.group(0).replace(".", "<DOT>"),
             protected,
             flags=re.I,

@@ -35,7 +35,7 @@ DEPARTMENT_PATTERN = re.compile(
 OPERATIVE_MARKER_RE = re.compile(
     r"\b(?:we\s+(?:direct|order|allow|dismiss|dispose)|"
     r"(?:is|are)\s+directed\s+to|ordered\s+to|"
-    r"shall\s+(?:file|pay|release|reconsider|issue|remove|update|comply|provide|communicate|forward|send|retotal|re-total)|"
+    r"shall\s+(?:file|pay|deposit|release|reconsider|issue|remove|update|comply|provide|communicate|forward|send|retotal|re-total)|"
     r"grant\s+leave\b.{0,160}\btag\s+this\s+appeal|tag\s+this\s+appeal|"
     r"set\s+aside\b.{0,160}\bremit(?:ted)?\b|"
     r"remit(?:ted)?\s+(?:the\s+)?(?:matters?|cases?|appeals?|petitions?)\s+to|"

@@ -600,18 +600,20 @@ def call_opencode(
     max_tokens: int = 8192,
 ) -> str:
     """OpenCode OpenAI-compatible chat completions call."""
+    payload = {
+        "model": model or DEFAULT_MODELS["opencode"],
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
     response = _post(
         _opencode_base_url(),
         headers={
             "Authorization": f"Bearer {_opencode_api_key()}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": model or DEFAULT_MODELS["opencode"],
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
+        json=payload,
         timeout=_request_timeout(),
     )
 

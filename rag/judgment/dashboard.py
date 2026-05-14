@@ -16,6 +16,7 @@ def to_dashboard_record(package: JudgmentReviewPackage) -> DashboardRecord | Non
     action_categories = []
     due_dates = []
     escalations = []
+    action_register = []
     highest_priority = "low"
 
     for item in package.action_items:
@@ -32,6 +33,22 @@ def to_dashboard_record(package: JudgmentReviewPackage) -> DashboardRecord | Non
             escalations.append(item.escalation_recommendation)
         if _PRIORITY_RANK.get(item.priority, 0) > _PRIORITY_RANK.get(highest_priority, 0):
             highest_priority = item.priority
+        first_evidence = item.evidence[0] if item.evidence else None
+        action_register.append(
+            {
+                "title": item.title,
+                "owner": item.responsible_department,
+                "department": item.responsible_department,
+                "category": item.category,
+                "priority": item.priority,
+                "deadline": item.timeline.due_date,
+                "timeline": item.timeline.raw_text,
+                "timeline_type": item.timeline.timeline_type or item.timeline_type,
+                "status": getattr(package.review_status, "value", package.review_status),
+                "evidence_count": len(item.evidence),
+                "evidence_page": getattr(first_evidence, "page", None) if first_evidence else None,
+            }
+        )
 
     return DashboardRecord(
         case_number=package.extraction.case_number.value,
@@ -45,6 +62,7 @@ def to_dashboard_record(package: JudgmentReviewPackage) -> DashboardRecord | Non
         action_categories=action_categories,
         due_dates=due_dates,
         escalations=escalations,
+        action_register=action_register,
     )
 
 

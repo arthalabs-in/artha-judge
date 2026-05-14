@@ -62,6 +62,38 @@ def test_llm_complete_reports_lower_level_timing_without_changing_response(monke
     assert "http_elapsed_s" in event
 
 
+def test_opencode_transport_requests_json_object_response(monkeypatch):
+    import llm_router
+
+    captured = {}
+
+    def fake_post(url, *, headers, json, timeout, **kwargs):
+        captured["json"] = json
+
+        class Response:
+            status_code = 200
+            text = '{"choices":[{"message":{"content":"{}"}}]}'
+
+            @staticmethod
+            def json():
+                return {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+        return Response()
+
+    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "_post", fake_post)
+
+    assert (
+        llm_router.call_opencode(
+            [{"role": "user", "content": "Return JSON."}],
+            model="deepseek-v4-flash",
+            max_tokens=64,
+        )
+        == '{"ok": true}'
+    )
+    assert captured["json"]["response_format"] == {"type": "json_object"}
+
+
 def test_llm_raw_cache_reuses_exact_raw_response_and_still_returns_text(monkeypatch):
     import rag.llm as llm
 

@@ -377,6 +377,7 @@ async def export_dashboard_records(user_id: str, format: str = Query("json")):
         "highest_priority",
         "action_categories",
         "due_dates",
+        "action_register",
         "risk_flags",
     ]
     buffer = io.StringIO()

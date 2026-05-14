@@ -259,6 +259,27 @@ def test_disposition_only_action_does_not_assign_noisy_department():
     assert "inferred_assignee_review" not in action.ambiguity_flags
 
 
+def test_disposition_only_action_title_uses_case_and_outcome():
+    extraction = JudgmentExtraction(
+        case_number=ExtractedField("case_number", value="WP No. 200065 of 2025"),
+        disposition=ExtractedField("disposition", value="dismissed", raw_value="The writ petition is dismissed."),
+    )
+
+    action = build_action_plan(extraction)[0]
+
+    assert action.title == "Review dismissed outcome for WP No. 200065 of 2025"
+    assert action.title != "Review judgment outcome for appeal or compliance decision"
+
+
+def test_sentence_splitter_does_not_treat_items_as_ms_abbreviation():
+    from rag.judgment.extractor import _judgment_sentences
+
+    assert _judgment_sentences("Final order items. This Writ Petition is dismissed.") == [
+        "Final order items.",
+        "This Writ Petition is dismissed.",
+    ]
+
+
 def test_supreme_court_labeled_parties_and_filename_date_are_preferred():
     package = build_judgment_review_package(
         [
@@ -924,6 +945,9 @@ def test_review_decision_edit_approves_package_and_dashboard_projection():
     assert records[0].case_number == "Writ Petition No. 1234 of 2025"
     assert records[0].departments == ["Bruhat Bengaluru Mahanagara Palike"]
     assert records[0].pending_actions == ["Remove the encroachment"]
+    assert records[0].action_register[0]["title"] == "Remove the encroachment"
+    assert records[0].action_register[0]["owner"] == "Bruhat Bengaluru Mahanagara Palike"
+    assert records[0].action_register[0]["evidence_count"] >= 1
 
 
 def test_rejected_package_is_excluded_from_dashboard():

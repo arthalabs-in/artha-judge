@@ -36,12 +36,26 @@ def build_record_metrics(record: dict[str, Any], audit_events: list[dict[str, An
 
     profile = record.get("pdf_profile") or {}
     processing = record.get("processing_metrics") or {}
+    source_metadata = record.get("source_metadata") or {}
+    ocr_routing = str(source_metadata.get("ocr_routing") or "")
+    vision_ocr_used = (
+        ocr_routing.startswith("vision_ocr")
+        or bool(source_metadata.get("vision_fallback_used"))
+        or bool(processing.get("extraction_methods", {}).get("vision_ocr"))
+        or any(str(method).startswith("vision_") for method in extraction_methods)
+    )
+    ocr_used = bool(
+        profile.get("ocr_used")
+        or source_metadata.get("ocr_used")
+        or vision_ocr_used
+    )
     return {
         "record_id": record.get("record_id"),
         "processing_ms": processing.get("processing_ms"),
         "page_count": profile.get("page_count"),
-        "ocr_used": bool(profile.get("ocr_used") or record.get("source_metadata", {}).get("ocr_used")),
-        "ocr_pages": record.get("source_metadata", {}).get("ocr_pages", []),
+        "ocr_used": ocr_used,
+        "vision_ocr_used": vision_ocr_used,
+        "ocr_pages": source_metadata.get("ocr_pages") or source_metadata.get("vision_pages") or [],
         "evidence_coverage_percent": evidence_coverage,
         "ambiguous_count": ambiguous_count,
         "duplicate_count": len(record.get("duplicate_candidates") or []),
@@ -59,6 +73,8 @@ def build_dashboard_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
             "duplicate_count": 0,
             "average_confidence": 0,
             "evidence_coverage_percent": 0,
+            "ocr_used": False,
+            "vision_ocr_used": False,
         }
     metrics = [record.get("metrics") or build_record_metrics(record) for record in records]
     return {
@@ -74,4 +90,6 @@ def build_dashboard_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
         "evidence_coverage_percent": round(
             sum(item.get("evidence_coverage_percent", 0) for item in metrics) / len(metrics)
         ),
+        "ocr_used": any(bool(item.get("ocr_used")) for item in metrics),
+        "vision_ocr_used": any(bool(item.get("vision_ocr_used")) for item in metrics),
     }

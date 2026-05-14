@@ -46,7 +46,7 @@ def build_action_plan(extraction: JudgmentExtraction) -> list[ActionItem]:
         if category == ActionCategory.APPEAL_CONSIDERATION.value:
             evidence = list(extraction.disposition.evidence)
             action = ActionItem(
-                title="Review judgment outcome for appeal or compliance decision",
+                title=_disposition_review_title(extraction, disposition),
                 responsible_department=None,
                 timeline=Timeline(raw_text=None, due_date=None, confidence=0.0, timeline_type="missing"),
                 category=category,
@@ -65,6 +65,16 @@ def build_action_plan(extraction: JudgmentExtraction) -> list[ActionItem]:
             action_items.append(apply_inferred_action_owner(action, extraction))
 
     return action_items
+
+
+def _disposition_review_title(extraction: JudgmentExtraction, disposition: str) -> str:
+    case_number = str(extraction.case_number.value or "").strip()
+    normalized = str(disposition or "").strip().replace("_", " ")
+    if not normalized or normalized.lower() == "unknown":
+        normalized = "judgment outcome"
+    if case_number:
+        return f"Review {normalized} outcome for {case_number}"
+    return f"Review {normalized} judgment outcome"
 
 
 def _direction_to_action(

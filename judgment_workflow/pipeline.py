@@ -75,7 +75,27 @@ async def process_judgment_file(
     if progress_callback:
         progress_callback(stage="judgment_processing", message="Extracting judgment content...", pct=15.0)
 
-    hash_task = asyncio.create_task(timed_to_thread("document_hash", compute_document_hash, pdf_path))
+    document_hash = await timed_to_thread("document_hash", compute_document_hash, pdf_path)
+    cached_record = await repository.get_cached_record_by_hash(
+        user_id,
+        document_hash,
+        exclude_record_id=record_id,
+    )
+    if cached_record:
+        return await _create_cached_record_replay(
+            repository=repository,
+            user_id=user_id,
+            record_id=record_id,
+            cached_record=cached_record,
+            pdf_path=pdf_path,
+            original_file_name=original_file_name,
+            source_metadata=source_metadata,
+            document_hash=document_hash,
+            started_at=started_at,
+            stage_timings=stage_timings,
+            progress_callback=progress_callback,
+        )
+
     ocr_detection_task = asyncio.create_task(timed_to_thread("ocr_detection", detect_ocr_need, pdf_path))
     if embedding_model is None:
         extraction_task = asyncio.create_task(
@@ -105,7 +125,6 @@ async def process_judgment_file(
                 )
             )
 
-    document_hash = await hash_task
     duplicate_task = asyncio.create_task(
         timed_await(
             "exact_duplicate_lookup",
@@ -179,36 +198,43 @@ async def process_judgment_file(
     if text_layer_rejected and vision_extractor is not None:
         precomputed_vision_pages = select_vision_pages(merged_documents, pdf_profile)
         source_metadata["vision_pages"] = precomputed_vision_pages
-        precomputed_vision_result = await timed_await(
-            "vision_ocr_extraction",
-            vision_extractor.extract(
+        try:
+            precomputed_vision_result = await timed_await(
+                "vision_ocr_extraction",
+                vision_extractor.extract(
+                    pdf_path=pdf_path,
+                    pages=precomputed_vision_pages,
+                    deterministic_summary={
+                        "case_number": None,
+                        "court": None,
+                        "bench": [],
+                        "judgment_date": None,
+                        "parties": [],
+                        "petitioners": [],
+                        "respondents": [],
+                        "disposition": None,
+                        "risk_flags": ["text_layer_rejected", "ocr_required"],
+                    },
+                ),
+            )
+        except Exception as exc:
+            source_metadata["vision_error"] = str(exc)
+            source_metadata["vision_fallback_used"] = False
+            source_metadata["vision_provider"] = getattr(vision_extractor, "provider", "minicpm") or "minicpm"
+            source_metadata["vision_failure_stage"] = "vision_ocr_extraction"
+        if precomputed_vision_result is not None:
+            source_metadata["vision_provider"] = getattr(precomputed_vision_result, "provider", "minicpm") or "minicpm"
+            source_metadata["vision_raw_json"] = precomputed_vision_result.raw_json
+            source_metadata["vision_fallback_used"] = True
+            vision_documents = _vision_result_documents(
+                precomputed_vision_result,
                 pdf_path=pdf_path,
-                pages=precomputed_vision_pages,
-                deterministic_summary={
-                    "case_number": None,
-                    "court": None,
-                    "bench": [],
-                    "judgment_date": None,
-                    "parties": [],
-                    "petitioners": [],
-                    "respondents": [],
-                    "disposition": None,
-                    "risk_flags": ["text_layer_rejected", "ocr_required"],
-                },
-            ),
-        )
-        source_metadata["vision_provider"] = getattr(precomputed_vision_result, "provider", "minicpm") or "minicpm"
-        source_metadata["vision_raw_json"] = precomputed_vision_result.raw_json
-        source_metadata["vision_fallback_used"] = True
-        vision_documents = _vision_result_documents(
-            precomputed_vision_result,
-            pdf_path=pdf_path,
-            original_file_name=original_file_name,
-            source_metadata=source_metadata,
-            pdf_profile=pdf_profile,
-        )
-        if vision_documents:
-            merged_documents = vision_documents
+                original_file_name=original_file_name,
+                source_metadata=source_metadata,
+                pdf_profile=pdf_profile,
+            )
+            if vision_documents:
+                merged_documents = vision_documents
 
     if progress_callback:
         progress_callback(stage="judgment_extraction", message="Building review package...", pct=55.0)
@@ -335,6 +361,66 @@ async def process_judgment_file(
     return record
 
 
+async def _create_cached_record_replay(
+    *,
+    repository: JudgmentRepository,
+    user_id: str,
+    record_id: str,
+    cached_record: dict[str, Any],
+    pdf_path: str,
+    original_file_name: str | None,
+    source_metadata: dict[str, Any],
+    document_hash: str,
+    started_at: float,
+    stage_timings: list[dict[str, Any]],
+    progress_callback=None,
+) -> dict[str, Any]:
+    if original_file_name:
+        source_metadata.setdefault("original_file_name", original_file_name)
+    await _replay_cached_progress(progress_callback)
+    record_root = Path(JUDGMENT_DATA_ROOT) / user_id / record_id
+    record_root.mkdir(parents=True, exist_ok=True)
+    highlighted_pdf_path = str(record_root / "highlighted.pdf")
+    record = await repository.create_record_from_cache(
+        user_id=user_id,
+        record_id=record_id,
+        cached_record=cached_record,
+        source_metadata=source_metadata,
+        original_pdf_path=pdf_path,
+        highlighted_pdf_path=highlighted_pdf_path,
+        document_hash=document_hash,
+        processing_mode="cache_replay",
+    )
+    processing_metrics = {
+        **(cached_record.get("processing_metrics") or {}),
+        "cache_hit": True,
+        "cache_source_record_id": cached_record.get("record_id"),
+        "processing_ms": round((perf_counter() - started_at) * 1000),
+        "stage_timings": [
+            *stage_timings,
+            {"stage": "cache_replay", "duration_ms": round((perf_counter() - started_at) * 1000)},
+        ],
+    }
+    record = await repository.update_record_metadata(user_id, record_id, processing_metrics=processing_metrics)
+    record["processing_metrics"] = processing_metrics
+    return record
+
+
+async def _replay_cached_progress(progress_callback) -> None:
+    if not progress_callback:
+        return
+    stages = [
+        ("ocr_detection", "Checking whether OCR is needed...", 35.0),
+        ("judgment_extraction", "Loading verified extraction and action plan...", 55.0),
+        ("highlight_generation", "Preparing source proof viewer...", 75.0),
+        ("record_storage", "Saving review package...", 90.0),
+        ("complete", "Judgment workflow complete.", 100.0),
+    ]
+    for stage, message, pct in stages:
+        await asyncio.sleep(0.35)
+        progress_callback(stage=stage, message=message, pct=pct)
+
+
 async def _apply_vision_fallback_if_needed(
     review_package,
     *,
@@ -453,10 +539,6 @@ def _vision_result_documents(
     source_metadata: dict[str, Any],
     pdf_profile: dict[str, Any],
 ) -> list[Document]:
-    raw_json = vision_result.raw_json or {
-        "case_details": vision_result.fields,
-        "key_directions_orders": [{"text": item} for item in vision_result.directions],
-    }
     page_numbers = {
         int(page)
         for page in (vision_result.evidence_pages or {}).values()
@@ -467,8 +549,8 @@ def _vision_result_documents(
     content = (
         "VISION OCR EXTRACTION FROM RENDERED PDF PAGES\n"
         "This document is generated by the local MiniCPM vision OCR model after rejecting a corrupted embedded text layer.\n"
-        "Use this structured extraction as OCR text for downstream judgment extraction and action planning.\n"
-        f"{json.dumps(raw_json, ensure_ascii=False, indent=2, default=str)}"
+        "Use this clean OCR text for downstream judgment extraction and action planning.\n"
+        f"{_vision_structured_ocr_text(vision_result)}"
     )
     documents = []
     for page in sorted(page_numbers):
@@ -491,6 +573,90 @@ def _vision_result_documents(
             metadata["source_system"] = source_metadata["source_system"]
         documents.append(Document(page_content=content, metadata=metadata))
     return documents
+
+
+def _vision_structured_ocr_text(vision_result) -> str:
+    raw_json = vision_result.raw_json or {}
+    fields = vision_result.fields or {}
+    lines = ["VISION OCR STRUCTURED TEXT"]
+    for label, key in (
+        ("case_number", "case_number"),
+        ("case_type", "case_type"),
+        ("court", "court"),
+        ("judgment_date", "judgment_date"),
+        ("disposition", "disposition"),
+    ):
+        value = _vision_scalar_text(fields.get(key))
+        if value not in (None, "", []):
+            lines.append(f"{label}: {value}.")
+    for label, key in (
+        ("bench", "bench"),
+        ("petitioners", "petitioners"),
+        ("respondents", "respondents"),
+        ("departments", "departments"),
+        ("responsible_entities", "responsible_entities"),
+        ("advocates", "advocates"),
+    ):
+        values = [str(item).strip() for item in (fields.get(key) or []) if str(item or "").strip()]
+        if values:
+            lines.append(f"{label}: {', '.join(values)}.")
+    lines.append("VISION OCR ACTION CONTEXT.")
+    final_excerpt = _vision_scalar_text(raw_json.get("verbatim_final_order_excerpt"))
+    if final_excerpt:
+        lines.append(f"final_order_excerpt: {final_excerpt}")
+    seen_directions: set[str] = set()
+    if vision_result.directions:
+        lines.append("Final order follows.")
+        for direction in vision_result.directions:
+            text = _vision_scalar_text(direction)
+            if text and text.lower() not in seen_directions:
+                seen_directions.add(text.lower())
+                lines.append(text)
+    raw_directions = raw_json.get("key_directions_orders")
+    if isinstance(raw_directions, list):
+        raw_texts = []
+        for item in raw_directions:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("direction") or item.get("order")
+            else:
+                text = item
+            clean_text = _vision_scalar_text(text)
+            if clean_text and clean_text.lower() not in seen_directions:
+                raw_texts.append(clean_text)
+                seen_directions.add(clean_text.lower())
+        if raw_texts:
+            lines.append("Additional final order follows.")
+            lines.extend(raw_texts)
+    timelines = raw_json.get("relevant_timelines")
+    if isinstance(timelines, list):
+        timeline_texts = []
+        for item in timelines:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("raw_text")
+            else:
+                text = item
+            clean_text = _vision_scalar_text(text)
+            if clean_text:
+                timeline_texts.append(clean_text)
+        if timeline_texts:
+            lines.append("Timelines.")
+            lines.extend(f"- {text}" for text in timeline_texts)
+    return "\n".join(lines)
+
+
+def _vision_scalar_text(value: Any) -> str | None:
+    if value in (None, "", []):
+        return None
+    if isinstance(value, dict):
+        for key in ("text", "raw_text", "value", "status", "reason", "order", "direction"):
+            text = _vision_scalar_text(value.get(key))
+            if text:
+                return text
+        return None
+    if isinstance(value, list):
+        parts = [text for item in value if (text := _vision_scalar_text(item))]
+        return ", ".join(parts) if parts else None
+    return str(value).strip()
 
 
 def _merge_duplicate_candidates(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
