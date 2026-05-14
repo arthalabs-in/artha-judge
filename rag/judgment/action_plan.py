@@ -14,6 +14,21 @@ _ACTION_PATTERNS = [
     re.compile(r"\b(?P<dept>state|government|department|board|authority|respondents?)\s+shall\s+(?P<action>.+)$", re.I),
 ]
 
+_INVALID_OWNER_TOKENS = {
+    "aforesaid order",
+    "appeal",
+    "case",
+    "decree",
+    "impugned order",
+    "judgment",
+    "matter",
+    "order",
+    "order dated",
+    "petition",
+    "said order",
+    "writ",
+}
+
 
 def build_action_plan(extraction: JudgmentExtraction) -> list[ActionItem]:
     action_items: list[ActionItem] = []
@@ -31,8 +46,8 @@ def build_action_plan(extraction: JudgmentExtraction) -> list[ActionItem]:
         if category == ActionCategory.APPEAL_CONSIDERATION.value:
             evidence = list(extraction.disposition.evidence)
             action = ActionItem(
-                title="Review judgment outcome for appeal or compliance decision",
-                responsible_department=_first_department(extraction),
+                title=_disposition_review_title(extraction, disposition),
+                responsible_department=None,
                 timeline=Timeline(raw_text=None, due_date=None, confidence=0.0, timeline_type="missing"),
                 category=category,
                 priority="high",
@@ -42,7 +57,7 @@ def build_action_plan(extraction: JudgmentExtraction) -> list[ActionItem]:
                 notes=["No explicit operational direction found; legal review suggested from disposition."],
                 action_id="action-0",
                 direction_summary=str(extraction.disposition.raw_value or disposition),
-                owner_source="department_extraction" if _first_department(extraction) else None,
+                owner_source=None,
                 timeline_type="missing",
                 ambiguity_flags=flags + ["no_explicit_operational_direction"],
                 escalation_recommendation=escalation or "legal_reviewer",
@@ -50,6 +65,16 @@ def build_action_plan(extraction: JudgmentExtraction) -> list[ActionItem]:
             action_items.append(apply_inferred_action_owner(action, extraction))
 
     return action_items
+
+
+def _disposition_review_title(extraction: JudgmentExtraction, disposition: str) -> str:
+    case_number = str(extraction.case_number.value or "").strip()
+    normalized = str(disposition or "").strip().replace("_", " ")
+    if not normalized or normalized.lower() == "unknown":
+        normalized = "judgment outcome"
+    if case_number:
+        return f"Review {normalized} outcome for {case_number}"
+    return f"Review {normalized} judgment outcome"
 
 
 def _direction_to_action(
@@ -66,9 +91,11 @@ def _direction_to_action(
     for pattern in _ACTION_PATTERNS:
         match = pattern.search(direction_text)
         if match:
-            owner = _clean_owner(match.group("dept"))
+            candidate_owner = _clean_owner(match.group("dept"))
             action_text = _clean_action(match.group("action"))
-            owner_source = "source_text"
+            if candidate_owner:
+                owner = candidate_owner
+                owner_source = "source_text"
             break
 
     timeline = _parse_timeline(direction_text, judgment_date)
@@ -138,12 +165,9 @@ def _clean_owner(value: str) -> str | None:
     value = re.sub(r"^(?:that\s+)?the\s+", "", value, flags=re.I)
     if not value or len(value) > 120:
         return None
+    if value.lower() in _INVALID_OWNER_TOKENS:
+        return None
     return value
-
-
-def _first_department(extraction: JudgmentExtraction) -> str | None:
-    departments = extraction.departments.value or []
-    return str(departments[0]) if departments else None
 
 
 def _word_or_int(value: str) -> int:

@@ -31,6 +31,13 @@ def test_action_plan_cards_use_decision_ready_layout():
     assert ".source-proof" in css
 
 
+def test_review_ui_exposes_manual_override_for_unsourced_human_edits():
+    js = (ROOT / "frontend" / "judgments.js").read_text(encoding="utf-8")
+
+    assert "data-field-manual-override" in js
+    assert 'data-prop="manual_override"' in js
+
+
 def test_review_screen_source_pdf_order_and_readability():
     html = (ROOT / "frontend" / "judgments.html").read_text(encoding="utf-8")
     css = (ROOT / "frontend" / "judgments.css").read_text(encoding="utf-8")

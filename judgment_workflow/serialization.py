@@ -304,6 +304,7 @@ def serialize_dashboard_record(record: DashboardRecord | dict[str, Any]) -> dict
         "action_categories": list(record.action_categories),
         "due_dates": serialize_value(record.due_dates),
         "escalations": list(record.escalations),
+        "action_register": serialize_value(record.action_register),
     }
 
 

@@ -192,3 +192,4 @@ class DashboardRecord:
     action_categories: list[str] = field(default_factory=list)
     due_dates: list[date] = field(default_factory=list)
     escalations: list[str] = field(default_factory=list)
+    action_register: list[dict[str, Any]] = field(default_factory=list)

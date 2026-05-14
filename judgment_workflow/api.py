@@ -41,18 +41,36 @@ from .schemas import (
 judgment_router = APIRouter(prefix="/judgments", tags=["judgments"])
 
 
+def _safe_user_id(user_id: str) -> str:
+    safe = secure_filename(str(user_id or "").strip())
+    if not safe:
+        raise HTTPException(status_code=400, detail="Invalid user_id provided.")
+    return safe
+
+
+def _record_root(user_id: str, record_id: str) -> Path:
+    data_root = Path(JUDGMENT_DATA_ROOT).resolve()
+    record_root = (data_root / user_id / record_id).resolve()
+    try:
+        record_root.relative_to(data_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid record path.") from exc
+    return record_root
+
+
 @judgment_router.post("/upload", response_model=JudgmentUploadResponse)
 async def upload_judgment(
     user_id: str = Form(...),
     file: UploadFile = File(...),
     sync: bool = Query(False),
 ):
+    user_id = _safe_user_id(user_id)
     sanitized_filename = secure_filename(file.filename or "")
     if not sanitized_filename:
         raise HTTPException(status_code=400, detail="Invalid filename provided.")
 
     record_id = uuid.uuid4().hex
-    record_root = Path(JUDGMENT_DATA_ROOT) / user_id / record_id
+    record_root = _record_root(user_id, record_id)
     record_root.mkdir(parents=True, exist_ok=True)
     pdf_path = record_root / "original.pdf"
     pdf_path.write_bytes(await file.read())
@@ -73,12 +91,13 @@ async def upload_judgment_with_progress(
     user_id: str = Form(...),
     file: UploadFile = File(...),
 ):
+    user_id = _safe_user_id(user_id)
     sanitized_filename = secure_filename(file.filename or "")
     if not sanitized_filename:
         raise HTTPException(status_code=400, detail="Invalid filename provided.")
 
     record_id = uuid.uuid4().hex
-    record_root = Path(JUDGMENT_DATA_ROOT) / user_id / record_id
+    record_root = _record_root(user_id, record_id)
     record_root.mkdir(parents=True, exist_ok=True)
     pdf_path = record_root / "original.pdf"
     pdf_path.write_bytes(await file.read())
@@ -104,6 +123,7 @@ async def upload_judgment_with_progress(
 
 @judgment_router.post("/from-ccms", response_model=JudgmentUploadResponse)
 async def upload_judgment_from_ccms(payload: CCMSFetchRequest, sync: bool = Query(False)):
+    user_id = _safe_user_id(payload.user_id)
     record_id = uuid.uuid4().hex
     client = CCMSClient(base_url=CCMS_BASE_URL, api_key=CCMS_API_KEY)
     try:
@@ -111,7 +131,7 @@ async def upload_judgment_from_ccms(payload: CCMSFetchRequest, sync: bool = Quer
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch CCMS case: {exc}") from exc
 
-    record_root = Path(JUDGMENT_DATA_ROOT) / payload.user_id / record_id
+    record_root = _record_root(user_id, record_id)
     record_root.mkdir(parents=True, exist_ok=True)
     pdf_path = record_root / "original.pdf"
     pdf_path.write_bytes(case_payload["pdf_bytes"])
@@ -125,7 +145,7 @@ async def upload_judgment_from_ccms(payload: CCMSFetchRequest, sync: bool = Quer
         metadata["source_system"] = "mock_ccms"
 
     return await _queue_or_process(
-        user_id=payload.user_id,
+        user_id=user_id,
         pdf_path=str(pdf_path),
         record_id=record_id,
         original_file_name=f"{payload.ccms_case_id}.pdf",
@@ -137,6 +157,7 @@ async def upload_judgment_from_ccms(payload: CCMSFetchRequest, sync: bool = Quer
 
 @judgment_router.post("/from-ccms-progress")
 async def upload_judgment_from_ccms_with_progress(payload: CCMSFetchRequest):
+    user_id = _safe_user_id(payload.user_id)
     record_id = uuid.uuid4().hex
     client = CCMSClient(base_url=CCMS_BASE_URL, api_key=CCMS_API_KEY)
     try:
@@ -144,7 +165,7 @@ async def upload_judgment_from_ccms_with_progress(payload: CCMSFetchRequest):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch CCMS case: {exc}") from exc
 
-    record_root = Path(JUDGMENT_DATA_ROOT) / payload.user_id / record_id
+    record_root = _record_root(user_id, record_id)
     record_root.mkdir(parents=True, exist_ok=True)
     pdf_path = record_root / "original.pdf"
     pdf_path.write_bytes(case_payload["pdf_bytes"])
@@ -161,7 +182,7 @@ async def upload_judgment_from_ccms_with_progress(payload: CCMSFetchRequest):
 
     async def process(progress_callback):
         return await process_judgment_file(
-            user_id=payload.user_id,
+            user_id=user_id,
             pdf_path=str(pdf_path),
             record_id=record_id,
             original_file_name=f"{payload.ccms_case_id}.pdf",
@@ -178,8 +199,9 @@ async def upload_judgment_from_ccms_with_progress(payload: CCMSFetchRequest):
 
 @judgment_router.post("/demo-seed", response_model=JudgmentUploadResponse)
 async def create_demo_seed(user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     record_id = uuid.uuid4().hex
-    record_root = Path(JUDGMENT_DATA_ROOT) / user_id / record_id
+    record_root = _record_root(user_id, record_id)
     record_root.mkdir(parents=True, exist_ok=True)
     pdf_path = record_root / "original.pdf"
     pdf_path.write_bytes(build_demo_pdf_bytes())
@@ -196,8 +218,9 @@ async def create_demo_seed(user_id: str = Query(...)):
 
 @judgment_router.post("/demo-seed-progress")
 async def create_demo_seed_with_progress(user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     record_id = uuid.uuid4().hex
-    record_root = Path(JUDGMENT_DATA_ROOT) / user_id / record_id
+    record_root = _record_root(user_id, record_id)
     record_root.mkdir(parents=True, exist_ok=True)
     pdf_path = record_root / "original.pdf"
     pdf_path.write_bytes(build_demo_pdf_bytes())
@@ -237,6 +260,7 @@ async def evaluate_judgment_pdf(
     llm_enabled: bool = Form(True),
     metadata_json: str | None = Form(None),
 ):
+    user_id = _safe_user_id(user_id)
     sanitized_filename = secure_filename(file.filename or "")
     if not sanitized_filename:
         raise HTTPException(status_code=400, detail="Invalid filename provided.")
@@ -257,7 +281,7 @@ async def evaluate_judgment_pdf(
         source_metadata["original_file_name"] = sanitized_filename
 
     record_id = uuid.uuid4().hex
-    record_root = Path(JUDGMENT_DATA_ROOT) / user_id / record_id
+    record_root = _record_root(user_id, record_id)
     record_root.mkdir(parents=True, exist_ok=True)
     pdf_path = record_root / "original.pdf"
     pdf_path.write_bytes(await file.read())
@@ -289,6 +313,7 @@ async def list_judgment_records(
     case_query: str | None = Query(None),
     limit: int = Query(100),
 ):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     return {
         "records": await repository.list_records(
@@ -313,6 +338,7 @@ async def get_dashboard_records(
     case_query: str | None = Query(None),
     priority: str | None = Query(None),
 ):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     records = await repository.list_dashboard_records(user_id)
     filtered = repository.filter_dashboard_records(
@@ -333,6 +359,7 @@ async def get_dashboard_records(
 
 @judgment_router.get("/dashboard/{user_id}/export")
 async def export_dashboard_records(user_id: str, format: str = Query("json")):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     records = await repository.list_dashboard_records(user_id)
     if format.lower() == "json":
@@ -350,6 +377,7 @@ async def export_dashboard_records(user_id: str, format: str = Query("json")):
         "highest_priority",
         "action_categories",
         "due_dates",
+        "action_register",
         "risk_flags",
     ]
     buffer = io.StringIO()
@@ -367,6 +395,7 @@ async def export_dashboard_records(user_id: str, format: str = Query("json")):
 
 @judgment_router.get("/{record_id}")
 async def get_judgment_record(record_id: str, user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     record = await repository.get_record(user_id, record_id)
     if not record:
@@ -376,6 +405,7 @@ async def get_judgment_record(record_id: str, user_id: str = Query(...)):
 
 @judgment_router.delete("/{record_id}")
 async def delete_judgment_record(record_id: str, user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     try:
         await repository.delete_record(user_id, record_id)
@@ -386,6 +416,7 @@ async def delete_judgment_record(record_id: str, user_id: str = Query(...)):
 
 @judgment_router.get("/{record_id}/metrics")
 async def get_judgment_metrics(record_id: str, user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     record = await repository.get_record(user_id, record_id)
     if not record:
@@ -396,6 +427,7 @@ async def get_judgment_metrics(record_id: str, user_id: str = Query(...)):
 
 @judgment_router.get("/{record_id}/duplicates")
 async def get_judgment_duplicates(record_id: str, user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     record = await repository.get_record(user_id, record_id)
     if not record:
@@ -423,6 +455,7 @@ async def resolve_judgment_duplicate(
     payload: DuplicateResolutionRequest,
     user_id: str = Query(...),
 ):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     try:
         return await repository.resolve_duplicate(
@@ -443,6 +476,7 @@ async def review_judgment_record(
     payload: JudgmentReviewRequest,
     user_id: str = Query(...),
 ):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     extraction_updates = {
         key: value.model_dump(exclude_none=True) if hasattr(value, "model_dump") else value
@@ -467,8 +501,9 @@ async def review_judgment_record(
 
 @judgment_router.post("/{record_id}/ask")
 async def ask_judgment_record(record_id: str, payload: JudgmentQuestionRequest):
+    user_id = _safe_user_id(payload.user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
-    record = await repository.get_record(payload.user_id, record_id)
+    record = await repository.get_record(user_id, record_id)
     if not record:
         raise HTTPException(status_code=404, detail="Judgment record not found.")
     return _answer_from_record(record, payload.question)
@@ -476,12 +511,14 @@ async def ask_judgment_record(record_id: str, payload: JudgmentQuestionRequest):
 
 @judgment_router.get("/{record_id}/audit")
 async def get_judgment_audit(record_id: str, user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     return {"events": await repository.list_audit_events(user_id, record_id)}
 
 
 @judgment_router.get("/{record_id}/debug-extraction")
 async def get_judgment_extraction_debug(record_id: str, user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     record = await repository.get_record(user_id, record_id)
     if not record:
@@ -497,6 +534,7 @@ async def get_judgment_extraction_debug(record_id: str, user_id: str = Query(...
 
 @judgment_router.get("/{record_id}/highlighted-pdf")
 async def get_highlighted_pdf(record_id: str, user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     record = await repository.get_record(user_id, record_id)
     if not record:
@@ -508,7 +546,7 @@ async def get_highlighted_pdf(record_id: str, user_id: str = Query(...)):
         raise HTTPException(status_code=404, detail="Original PDF not found.")
 
     if not highlighted_pdf_path:
-        highlighted_pdf_path = str(Path(JUDGMENT_DATA_ROOT) / user_id / record_id / "highlighted.pdf")
+        highlighted_pdf_path = str(_record_root(user_id, record_id) / "highlighted.pdf")
     if not os.path.exists(highlighted_pdf_path):
         generate_highlighted_pdf(original_pdf_path, highlighted_pdf_path, record)
         await repository.update_record_metadata(
@@ -525,6 +563,7 @@ async def get_highlighted_pdf(record_id: str, user_id: str = Query(...)):
 
 @judgment_router.get("/{record_id}/highlighted-page/{page_number}")
 async def get_highlighted_page(record_id: str, page_number: int, user_id: str = Query(...)):
+    user_id = _safe_user_id(user_id)
     repository = JudgmentRepository(storage=get_storage(), canvas_app_id=CANVAS_APP_ID)
     record = await repository.get_record(user_id, record_id)
     if not record:
@@ -536,7 +575,7 @@ async def get_highlighted_page(record_id: str, page_number: int, user_id: str = 
         raise HTTPException(status_code=404, detail="Original PDF not found.")
 
     if not highlighted_pdf_path:
-        highlighted_pdf_path = str(Path(JUDGMENT_DATA_ROOT) / user_id / record_id / "highlighted.pdf")
+        highlighted_pdf_path = str(_record_root(user_id, record_id) / "highlighted.pdf")
     if not os.path.exists(highlighted_pdf_path):
         generate_highlighted_pdf(original_pdf_path, highlighted_pdf_path, record)
         await repository.update_record_metadata(

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from datetime import UTC, datetime
-from typing import Any
 from difflib import SequenceMatcher
+from typing import Any
 
 from rag.judgment.dashboard import to_dashboard_record
 
@@ -13,6 +14,65 @@ from .serialization import (
     serialize_dashboard_record,
     serialize_review_package,
 )
+
+
+_INVALID_DASHBOARD_OWNER_RE = re.compile(
+    r"^(?:"
+    r"delay(?:\s+in\s+filing\s+the\s+appeal)?|"
+    r"compensation|"
+    r"costs?|"
+    r"appeals?|"
+    r"petitions?|"
+    r"writ(?:\s+petition)?|"
+    r"case|"
+    r"matter|"
+    r"order|"
+    r"judgment|"
+    r"relief"
+    r")$",
+    re.I,
+)
+
+_OWNER_FROM_ACTION_RE = re.compile(
+    r"\b(?:before|to|through|by)\s+(?:the\s+)?"
+    r"(?P<owner>"
+    r"Reference\s+Court|"
+    r"Special\s+Land\s+Acquisition\s+Officer|"
+    r"Spl\.?\s*LAO|"
+    r"Registrar(?:\s+General)?|"
+    r"High\s+Court(?:\s+Registry)?|"
+    r"Registry|"
+    r"Deputy\s+Commissioner|"
+    r"State\s+Government|"
+    r"Government\s+of\s+[A-Z][A-Za-z ]+"
+    r")\b",
+    re.I,
+)
+
+
+def _clean_dashboard_owner(owner: Any, *context_parts: Any) -> str:
+    text = str(owner or "").strip(" .,:;-")
+    if text and not _INVALID_DASHBOARD_OWNER_RE.match(text):
+        return text
+    context = " ".join(str(part or "") for part in context_parts)
+    match = _OWNER_FROM_ACTION_RE.search(context)
+    if match:
+        found = re.sub(r"\s+", " ", match.group("owner").strip(" .,:;-"))
+        if re.fullmatch(r"Spl\.?\s*LAO", found, flags=re.I):
+            return "Special Land Acquisition Officer"
+        return found
+    return "Case reviewer"
+
+
+def _missing_field_count(extraction: dict[str, Any]) -> int:
+    count = 0
+    for key, field in (extraction or {}).items():
+        if key in {"directions", "risk_flags", "legal_phrases"} or not isinstance(field, dict):
+            continue
+        value = field.get("value")
+        if value in (None, "", []) or str(value).strip().lower() == "unknown":
+            count += 1
+    return count
 
 
 class JudgmentRepository:
@@ -251,7 +311,17 @@ class JudgmentRepository:
             if dashboard_record:
                 merged = deepcopy(dashboard_record)
                 merged["record_id"] = payload.get("record_id", snapshot.id)
-                merged["metrics"] = payload.get("metrics", {})
+                merged["action_register"] = self._clean_action_register(
+                    merged.get("action_register") or self._action_register_from_payload(payload),
+                    merged,
+                )
+                merged["departments"] = self._dashboard_departments(merged)
+                metrics = dict(payload.get("metrics") or {})
+                fresh_metrics = build_record_metrics(payload)
+                metrics["ocr_used"] = bool(metrics.get("ocr_used") or fresh_metrics.get("ocr_used"))
+                metrics["vision_ocr_used"] = bool(metrics.get("vision_ocr_used") or fresh_metrics.get("vision_ocr_used"))
+                metrics["ocr_pages"] = metrics.get("ocr_pages") or fresh_metrics.get("ocr_pages")
+                merged["metrics"] = metrics
                 merged["overall_confidence"] = payload.get("overall_confidence", 0)
                 merged["updated_at"] = payload.get("updated_at")
                 records.append(merged)
@@ -304,6 +374,87 @@ class JudgmentRepository:
             if payload.get("document_hash") == document_hash:
                 matches.append(self._queue_row(payload, snapshot.id))
         return matches
+
+    async def get_cached_record_by_hash(
+        self,
+        user_id: str,
+        document_hash: str,
+        *,
+        exclude_record_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not document_hash:
+            return None
+        candidates = []
+        async for snapshot in self._records_collection(user_id).stream():
+            payload = snapshot.to_dict() or {}
+            record_id = payload.get("record_id", snapshot.id)
+            if exclude_record_id and record_id == exclude_record_id:
+                continue
+            if payload.get("document_hash") == document_hash and payload.get("extraction") and payload.get("action_items"):
+                candidates.append(payload)
+        if not candidates:
+            return None
+        status_rank = {"approved": 0, "edited": 1, "completed": 2, "pending_review": 3}
+        return sorted(
+            candidates,
+            key=lambda item: (
+                status_rank.get(item.get("review_status"), 9),
+                str(item.get("updated_at", "")),
+            ),
+        )[0]
+
+    async def create_record_from_cache(
+        self,
+        *,
+        user_id: str,
+        record_id: str,
+        cached_record: dict[str, Any],
+        source_metadata: dict[str, Any],
+        original_pdf_path: str,
+        highlighted_pdf_path: str | None,
+        document_hash: str,
+        processing_mode: str = "cache_replay",
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        payload = deepcopy(cached_record)
+        cached_source_metadata = payload.get("source_metadata") or {}
+        payload.update(
+            {
+                "record_id": record_id,
+                "user_id": user_id,
+                "status": "processed",
+                "source_system": source_metadata.get("source_system", "manual_upload"),
+                "ccms_case_id": source_metadata.get("ccms_case_id"),
+                "original_pdf_path": original_pdf_path,
+                "highlighted_pdf_path": highlighted_pdf_path,
+                "processing_errors": [],
+                "document_hash": document_hash,
+                "duplicate_candidates": [],
+                "processing_mode": processing_mode,
+                "source_metadata": {
+                    **cached_source_metadata,
+                    **source_metadata,
+                    "cache_replay": True,
+                    "cache_source_record_id": cached_record.get("record_id"),
+                },
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        payload["metrics"] = build_record_metrics(payload)
+        payload["dashboard_record"] = self._dashboard_from_package(payload)
+        await self._record_ref(user_id, record_id).set(payload)
+        await self._audit_collection(user_id, record_id).add(
+            {
+                "event_type": "record_created",
+                "reviewer_id": None,
+                "notes": "Judgment record loaded from a verified cached processing package.",
+                "target_type": "record",
+                "target_id": record_id,
+                "created_at": now,
+            }
+        )
+        return payload
 
     async def find_near_duplicate_candidates(
         self,
@@ -376,16 +527,56 @@ class JudgmentRepository:
     ) -> list[dict[str, Any]]:
         filtered = []
         for record in records:
-            if department and department.lower() not in " ".join(record.get("departments", [])).lower():
+            row_filtered_record = deepcopy(record)
+            action_rows = [
+                row
+                for row in row_filtered_record.get("action_register", [])
+                if isinstance(row, dict)
+            ]
+            owner_haystack = " ".join(
+                str(value or "")
+                for value in [
+                    *(record.get("departments") or []),
+                    *[
+                        item.get("owner") or item.get("department") or ""
+                        for item in record.get("action_register", [])
+                        if isinstance(item, dict)
+                    ],
+                ]
+            ).lower()
+            if department and department.lower() not in owner_haystack:
                 continue
             if action_type and action_type not in record.get("action_categories", []):
                 continue
+            if department or action_type:
+                scoped_rows = []
+                for row in action_rows:
+                    owner_text = " ".join(str(row.get(key) or "") for key in ("owner", "department")).lower()
+                    category_matches = not action_type or row.get("category") == action_type
+                    department_matches = not department or department.lower() in owner_text
+                    if category_matches and department_matches:
+                        scoped_rows.append(row)
+                if scoped_rows:
+                    row_filtered_record["action_register"] = scoped_rows
+                    row_filtered_record["departments"] = self._dashboard_departments(row_filtered_record)
             if review_status and record.get("review_status") != review_status:
                 continue
             if priority and record.get("highest_priority") != priority:
                 continue
             if case_query:
-                haystack = " ".join(str(record.get(key) or "") for key in ("case_number", "court", "record_id")).lower()
+                haystack = " ".join(
+                    str(value or "")
+                    for value in [
+                        record.get("case_number"),
+                        record.get("court"),
+                        record.get("record_id"),
+                        *[
+                            item.get("title") or ""
+                            for item in record.get("action_register", [])
+                            if isinstance(item, dict)
+                        ],
+                    ]
+                ).lower()
                 if case_query.lower() not in haystack:
                     continue
             due_dates = [str(item) for item in record.get("due_dates", []) if item]
@@ -393,7 +584,7 @@ class JudgmentRepository:
                 continue
             if deadline_to and due_dates and max(due_dates) > deadline_to:
                 continue
-            filtered.append(record)
+            filtered.append(row_filtered_record)
         return filtered
 
     def _dashboard_from_package(self, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -413,6 +604,60 @@ class JudgmentRepository:
             return None
         return serialize_dashboard_record(record)
 
+    def _action_register_from_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = []
+        for action in payload.get("action_items", []):
+            if action.get("category") == "internal_review":
+                continue
+            timeline = action.get("timeline") or {}
+            evidence = action.get("evidence") or []
+            first_evidence = evidence[0] if evidence else {}
+            rows.append(
+                {
+                    "title": action.get("title"),
+                    "owner": action.get("responsible_department"),
+                    "department": action.get("responsible_department"),
+                    "category": action.get("category"),
+                    "priority": action.get("priority"),
+                    "deadline": timeline.get("due_date"),
+                    "timeline": timeline.get("raw_text"),
+                    "timeline_type": timeline.get("timeline_type") or action.get("timeline_type"),
+                    "status": payload.get("review_status") or action.get("status"),
+                    "evidence_count": len(evidence),
+                    "evidence_page": first_evidence.get("page"),
+                }
+            )
+        return rows
+
+    def _clean_action_register(self, rows: list[dict[str, Any]], record: dict[str, Any]) -> list[dict[str, Any]]:
+        cleaned = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = deepcopy(row)
+            owner = _clean_dashboard_owner(
+                item.get("owner") or item.get("department"),
+                item.get("title"),
+                item.get("timeline"),
+            )
+            item["owner"] = owner
+            item["department"] = owner
+            item["status"] = record.get("review_status") or item.get("status")
+            cleaned.append(item)
+        return cleaned
+
+    def _dashboard_departments(self, record: dict[str, Any]) -> list[str]:
+        departments = []
+        for row in record.get("action_register", []):
+            if not isinstance(row, dict):
+                continue
+            owner = row.get("owner") or row.get("department")
+            if owner and owner not in departments:
+                departments.append(owner)
+        if departments:
+            return departments
+        return [item for item in record.get("departments", []) if item]
+
     def _queue_row(self, payload: dict[str, Any], snapshot_id: str) -> dict[str, Any]:
         extraction = payload.get("extraction", {})
         actions = payload.get("action_items", [])
@@ -429,6 +674,7 @@ class JudgmentRepository:
             "departments": departments,
             "review_status": payload.get("review_status", "pending_review"),
             "risk_flags": payload.get("risk_flags", []),
+            "missing_field_count": _missing_field_count(extraction),
             "action_count": len(actions),
             "action_categories": sorted({action.get("category") for action in actions if action.get("category")}),
             "escalations": sorted({action.get("escalation_recommendation") for action in actions if action.get("escalation_recommendation")}),

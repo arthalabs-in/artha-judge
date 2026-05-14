@@ -170,6 +170,37 @@ def test_action_plan_uses_remand_destination_before_public_respondent():
     assert "owner_unclear" not in action.ambiguity_flags
 
 
+def test_action_plan_specifies_generic_high_court_from_case_context():
+    extraction = JudgmentExtraction(
+        respondents=ExtractedField("respondents", value=["Commissioner of Customs, Mumbai"]),
+        departments=ExtractedField("departments", value=["High Court of Bombay"]),
+        directions=[
+            ExtractedField(
+                "direction",
+                value=(
+                    "From the judgment and order of the High Court of Bombay. "
+                    "We set aside the impugned judgment and remit the cases to the High Court "
+                    "for fresh consideration."
+                ),
+                evidence=[
+                    SourceEvidence(
+                        "judgment.pdf",
+                        6,
+                        "p6",
+                        "we set aside the impugned judgment and remit the cases to the High Court for fresh consideration.",
+                    )
+                ],
+            )
+        ],
+    )
+
+    action = build_action_plan(extraction)[0]
+
+    assert action.responsible_department == "High Court of Bombay"
+    assert action.owner_source == "remand_destination"
+    assert action.responsible_department != "Commissioner of Customs, Mumbai"
+
+
 def test_action_plan_resolves_remit_to_high_court_per_order():
     extraction = JudgmentExtraction(
         respondents=ExtractedField("respondents", value=["Commissioner of Customs, Mumbai"]),
@@ -188,6 +219,65 @@ def test_action_plan_resolves_remit_to_high_court_per_order():
     assert action.owner_source == "remand_destination"
     assert action.timeline.timeline_type == "not_specified"
     assert "timeline_not_specified" in action.ambiguity_flags
+
+
+def test_action_plan_rejects_document_word_as_owner():
+    extraction = JudgmentExtraction(
+        directions=[
+            ExtractedField(
+                "direction",
+                value="The order shall be communicated to the Registrar General for necessary action.",
+                evidence=[
+                    SourceEvidence(
+                        "judgment.pdf",
+                        11,
+                        "p11",
+                        "The order shall be communicated to the Registrar General for necessary action.",
+                    )
+                ],
+            )
+        ],
+    )
+
+    action = build_action_plan(extraction)[0]
+
+    assert action.responsible_department is None
+    assert action.owner_source is None
+    assert "owner_unclear" in action.ambiguity_flags
+
+
+def test_disposition_only_action_does_not_assign_noisy_department():
+    extraction = JudgmentExtraction(
+        departments=ExtractedField("departments", value=["Government of India issued a Notification No"]),
+        disposition=ExtractedField("disposition", value="allowed", raw_value="appeals are allowed"),
+    )
+
+    action = build_action_plan(extraction)[0]
+
+    assert action.responsible_department is None
+    assert action.owner_source is None
+    assert "inferred_assignee_review" not in action.ambiguity_flags
+
+
+def test_disposition_only_action_title_uses_case_and_outcome():
+    extraction = JudgmentExtraction(
+        case_number=ExtractedField("case_number", value="WP No. 200065 of 2025"),
+        disposition=ExtractedField("disposition", value="dismissed", raw_value="The writ petition is dismissed."),
+    )
+
+    action = build_action_plan(extraction)[0]
+
+    assert action.title == "Review dismissed outcome for WP No. 200065 of 2025"
+    assert action.title != "Review judgment outcome for appeal or compliance decision"
+
+
+def test_sentence_splitter_does_not_treat_items_as_ms_abbreviation():
+    from rag.judgment.extractor import _judgment_sentences
+
+    assert _judgment_sentences("Final order items. This Writ Petition is dismissed.") == [
+        "Final order items.",
+        "This Writ Petition is dismissed.",
+    ]
 
 
 def test_supreme_court_labeled_parties_and_filename_date_are_preferred():
@@ -645,6 +735,56 @@ def test_final_disposition_prefers_allowed_outcome_over_remand_direction():
     assert package.extraction.disposition.value == "allowed"
 
 
+def test_partly_allowed_final_order_is_not_downgraded_to_allowed():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "In the result, the appeals are partly allowed. "
+                    "The claimants shall be entitled to enhanced compensation."
+                ),
+                metadata={"source": "judgment.pdf", "page": 11, "chunk_id": "p11"},
+            )
+        ]
+    )
+
+    assert package.extraction.disposition.value == "partly_allowed"
+    assert "partly allowed" in package.extraction.disposition.raw_value.lower()
+
+
+def test_plain_remit_final_order_extracts_remand_action_and_specific_owner():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "Petition for Special Leave to Appeal. "
+                    "From the judgment and order dated 01/10/2008 in CA No. 52/2008 "
+                    "of The HIGH COURT OF BOMBAY. "
+                    "Government of India issued a Notification No. 64 of 1988."
+                ),
+                metadata={"source": "judgment.pdf", "page": 1, "chunk_id": "p1"},
+            ),
+            Document(
+                page_content=(
+                    "On this ground alone we set aside the impugned judgment dated October 1, 2008 "
+                    "in Customs Appeal Nos. 52, 53 and 55 of 2008 and remit the cases to the High Court "
+                    "for fresh consideration in accordance with law."
+                ),
+                metadata={"source": "judgment.pdf", "page": 2, "chunk_id": "p2"},
+            ),
+        ]
+    )
+
+    assert package.extraction.disposition.value == "remanded"
+    assert package.extraction.directions
+    assert "Government of India issued" not in package.extraction.departments.value
+    action = package.action_items[0]
+    assert action.title.startswith("On this ground alone")
+    assert "fresh consideration" in action.title.lower()
+    assert action.responsible_department == "High Court of Bombay"
+    assert action.owner_source == "remand_destination"
+
+
 def test_final_order_grant_leave_beats_prior_dismissal_history():
     package = build_judgment_review_package(
         [
@@ -668,6 +808,27 @@ def test_final_order_grant_leave_beats_prior_dismissal_history():
     assert package.extraction.disposition.value == "leave_granted"
     assert "grant leave" in package.extraction.disposition.raw_value.lower()
     assert package.extraction.disposition.evidence[0].page == 8
+
+
+def test_grant_leave_tag_direction_creates_registry_action():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "Accordingly, we grant leave and tag this appeal with "
+                    "C.A.No.7295 of 2012 and C.A.No.11895 of 2014."
+                ),
+                metadata={"source": "judgment.pdf", "page": 8, "chunk_id": "p8"},
+            )
+        ]
+    )
+
+    assert package.extraction.disposition.value == "leave_granted"
+    assert package.extraction.directions
+    action = package.action_items[0]
+    assert "tag this appeal" in action.title.lower()
+    assert action.responsible_department == "Registry"
+    assert action.owner_source == "procedural_registry"
 
 
 def test_signature_block_extracts_multiple_judges_with_date_between():
@@ -718,6 +879,49 @@ def test_tag_connected_appeal_uses_registry_owner_not_party():
     assert resolved.timeline.timeline_type == "not_specified"
 
 
+def test_chhattisgarh_style_header_extracts_standalone_bench_and_respondents():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "NAFR\n"
+                    "HIGH COURT OF CHHATTISGARH AT BILASPUR\n"
+                    "MAC No. 1227 of 2016\n"
+                    "Cholamandalam MS General Insurance Company Limited\n"
+                    "---- Appellant\n"
+                    "Versus\n"
+                    "Smt. Shanti Bai and others\n"
+                    "---- Respondents\n"
+                    "Hon'ble Shri Justice Sanjay Kumar Jaiswal\n"
+                    "Judgment on Board\n"
+                ),
+                metadata={"source": "judgment.pdf", "page": 3, "chunk_id": "p3"},
+            )
+        ]
+    )
+
+    assert package.extraction.bench.value == ["Justice Sanjay Kumar Jaiswal"]
+    assert package.extraction.respondents.value == ["Smt. Shanti Bai"]
+
+
+def test_future_facing_provide_direction_becomes_action_item():
+    package = build_judgment_review_package(
+        [
+            Document(
+                page_content=(
+                    "In future, the High Court shall provide question papers in "
+                    "Kannada and English to all candidates appearing for the examination."
+                ),
+                metadata={"source": "judgment.pdf", "page": 32, "chunk_id": "p32"},
+            )
+        ]
+    )
+
+    assert package.extraction.directions
+    assert package.action_items[0].title == "Provide question papers in Kannada and English to all candidates appearing for the examination"
+    assert package.action_items[0].responsible_department == "High Court"
+
+
 def test_review_decision_edit_approves_package_and_dashboard_projection():
     package = build_judgment_review_package(_sample_documents())
     edited_first_action = package.action_items[0]
@@ -741,6 +945,9 @@ def test_review_decision_edit_approves_package_and_dashboard_projection():
     assert records[0].case_number == "Writ Petition No. 1234 of 2025"
     assert records[0].departments == ["Bruhat Bengaluru Mahanagara Palike"]
     assert records[0].pending_actions == ["Remove the encroachment"]
+    assert records[0].action_register[0]["title"] == "Remove the encroachment"
+    assert records[0].action_register[0]["owner"] == "Bruhat Bengaluru Mahanagara Palike"
+    assert records[0].action_register[0]["evidence_count"] >= 1
 
 
 def test_rejected_package_is_excluded_from_dashboard():

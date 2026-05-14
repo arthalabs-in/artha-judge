@@ -85,7 +85,7 @@ async def build_llm_first_review_package(
     record_stage("llm_reranked_context", stage_started_at, top_k=len(detail_context))
 
     last_pages = _select_last_pages(documents, page_count, count=3)
-    action_context = _documents_to_context(last_pages, label="last_3_pages")
+    action_context = _documents_to_context(last_pages, label="last_3_pages", limit=None)
     action_supporting_context = _action_supporting_context(agentic_context)
     llm_context = {
         "first_page": precontext,
@@ -97,28 +97,37 @@ async def build_llm_first_review_package(
     }
     llm_outputs: dict[str, Any] = {}
 
-    details_payload = await timed_llm_json(
-        "llm_case_details",
-        _case_details_prompt(
-            precontext=precontext,
-            evidence_context=detail_context,
-            agentic_context=agentic_context,
-            deterministic_hints=deterministic_hints,
-            source_metadata=case_metadata or {},
-            pdf_profile=pdf_profile or {},
-        ),
-    )
-    if not details_payload:
+    case_details_source = "llm"
+    if _can_reuse_vision_case_details(deterministic_package, documents, case_metadata or {}):
+        case_details_source = "deterministic_vision_ocr"
+        details_payload = _details_payload_from_package(deterministic_package)
+        llm_outputs["case_details_skipped"] = {
+            "reason": "strong_vision_ocr_fields",
+            "source": "deterministic_vision_ocr",
+        }
+    else:
         details_payload = await timed_llm_json(
-            "llm_case_details_repair",
-            _case_details_repair_prompt(
+            "llm_case_details",
+            _case_details_prompt(
                 precontext=precontext,
+                evidence_context=detail_context,
                 agentic_context=agentic_context,
                 deterministic_hints=deterministic_hints,
                 source_metadata=case_metadata or {},
                 pdf_profile=pdf_profile or {},
             ),
         )
+        if not details_payload:
+            details_payload = await timed_llm_json(
+                "llm_case_details_repair",
+                _case_details_repair_prompt(
+                    precontext=precontext,
+                    agentic_context=agentic_context,
+                    deterministic_hints=deterministic_hints,
+                    source_metadata=case_metadata or {},
+                    pdf_profile=pdf_profile or {},
+                ),
+            )
     llm_outputs["case_details_initial"] = json.loads(json.dumps(details_payload)) if details_payload else {}
 
     for field_name in _missing_fields_to_repair(deterministic_package, details_payload):
@@ -151,7 +160,7 @@ async def build_llm_first_review_package(
     if _needs_more_action_context(action_payload):
         previous_pages = _select_previous_pages(documents, page_count, before_pages=3, count=3)
         if previous_pages:
-            previous_context = _documents_to_context(previous_pages, label="previous_3_pages")
+            previous_context = _documents_to_context(previous_pages, label="previous_3_pages", limit=None)
             llm_context["previous_action_context"] = previous_context
             action_payload = await timed_llm_json(
                 "llm_action_plan_second_pass",
@@ -168,7 +177,7 @@ async def build_llm_first_review_package(
     forced_action_pass = False
     if not action_payload.get("action_items"):
         forced_action_pass = True
-        forced_context = _documents_to_context(_select_final_pages(documents, page_count, count=6), label="final_6_pages")
+        forced_context = _documents_to_context(_select_final_pages(documents, page_count, count=6), label="final_6_pages", limit=None)
         llm_context["forced_action_context"] = forced_context
         action_payload = await timed_llm_json(
             "llm_action_plan_forced_decision",
@@ -201,10 +210,28 @@ async def build_llm_first_review_package(
         action_payload = _merge_action_repair_payload(action_payload, repair_payload)
         llm_outputs["action_plan"] = action_payload
 
-    if not details_payload:
-        raise RuntimeError("LLM case-detail extraction failed; deterministic fallback is disabled for LLM review mode.")
+    if not _details_payload_has_case_signal(details_payload):
+        return _llm_failure_fallback_package(
+            deterministic_package,
+            source_metadata=case_metadata or {},
+            reason="llm_case_details_failed",
+            review_mode="deterministic_after_llm_case_detail_failure",
+            stage_timings=stage_timings,
+            llm_context=llm_context,
+            llm_outputs=llm_outputs,
+            model_name=model_name,
+        )
     if not action_payload:
-        raise RuntimeError("LLM action-plan extraction failed; deterministic fallback is disabled for LLM review mode.")
+        return _llm_failure_fallback_package(
+            deterministic_package,
+            source_metadata=case_metadata or {},
+            reason="llm_action_plan_failed",
+            review_mode="deterministic_after_llm_action_plan_failure",
+            stage_timings=stage_timings,
+            llm_context=llm_context,
+            llm_outputs=llm_outputs,
+            model_name=model_name,
+        )
 
     stage_started_at = perf_counter()
     package = _package_from_llm_payloads(
@@ -224,6 +251,7 @@ async def build_llm_first_review_package(
             "llm_agentic_query_count": len(_context_plan_queries(context_plan)),
             "llm_agentic_context_count": len(agentic_context),
             "llm_context_plan_source": context_plan_source,
+            "llm_case_details_source": case_details_source,
             "llm_case_detail_top_k": 10,
             "llm_action_pages": [doc.metadata.get("page") for doc in last_pages],
             "llm_action_second_pass": bool(action_payload.get("second_pass_used")),
@@ -237,6 +265,151 @@ async def build_llm_first_review_package(
         llm_context=llm_context,
         llm_outputs=llm_outputs,
     )
+    return package
+
+
+def _details_payload_has_case_signal(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict) or not payload:
+        return False
+    case_details = payload.get("case_details")
+    if isinstance(case_details, dict):
+        for key in ("case_number", "court", "bench", "disposition"):
+            if case_details.get(key) not in (None, "", []):
+                return True
+    date_payload = payload.get("date_of_order")
+    if isinstance(date_payload, dict) and date_payload.get("value"):
+        return True
+    parties = payload.get("parties_involved")
+    if isinstance(parties, dict):
+        for key in ("petitioners", "respondents", "other_parties"):
+            if parties.get(key):
+                return True
+    return bool(payload.get("key_directions_orders"))
+
+
+def _can_reuse_vision_case_details(
+    package: JudgmentReviewPackage,
+    documents: list[Document],
+    source_metadata: dict[str, Any],
+) -> bool:
+    if not str(source_metadata.get("ocr_routing") or "").startswith("vision_ocr"):
+        return False
+    if not any(
+        str((doc.metadata or {}).get("extraction_method") or "").startswith("vision")
+        or (doc.metadata or {}).get("source_quality") == "vision_ocr"
+        for doc in documents
+    ):
+        return False
+    extraction = package.extraction
+    required_fields = (
+        extraction.case_number,
+        extraction.court,
+        extraction.bench,
+        extraction.judgment_date,
+        extraction.disposition,
+    )
+    if any(_is_empty_value(field.value) for field in required_fields):
+        return False
+    if str(extraction.disposition.value or "").strip().lower() == "unknown":
+        return False
+    return bool(extraction.directions)
+
+
+def _details_payload_from_package(package: JudgmentReviewPackage) -> dict[str, Any]:
+    extraction = package.extraction
+    case_evidence = _best_field_snippet(
+        extraction.case_number,
+        extraction.court,
+        extraction.bench,
+        extraction.disposition,
+    )
+    parties_evidence = _best_field_snippet(extraction.petitioners, extraction.respondents, extraction.parties)
+    date_evidence = _best_field_snippet(extraction.judgment_date)
+    return {
+        "case_details": {
+            "case_number": serialize_value_for_debug(extraction.case_number.value),
+            "case_type": serialize_value_for_debug(extraction.case_type.value),
+            "court": serialize_value_for_debug(extraction.court.value),
+            "bench": _as_list(extraction.bench.value),
+            "departments": _as_list(extraction.departments.value),
+            "advocates": _as_list(extraction.advocates.value),
+            "disposition": serialize_value_for_debug(extraction.disposition.value),
+            "evidence_snippet": case_evidence,
+            "bench_evidence_snippet": _best_field_snippet(extraction.bench),
+            "disposition_evidence_snippet": _best_field_snippet(extraction.disposition),
+        },
+        "date_of_order": {
+            "value": serialize_value_for_debug(extraction.judgment_date.value),
+            "raw_text": serialize_value_for_debug(extraction.judgment_date.raw_value or extraction.judgment_date.value),
+            "confidence": extraction.judgment_date.confidence,
+            "evidence_snippet": date_evidence,
+        },
+        "parties_involved": {
+            "petitioners": _as_list(extraction.petitioners.value),
+            "respondents": _as_list(extraction.respondents.value),
+            "other_parties": [],
+            "evidence_snippet": parties_evidence,
+        },
+        "key_directions_orders": [
+            {
+                "text": str(direction.value),
+                "confidence": direction.confidence,
+                "evidence_snippet": _best_field_snippet(direction),
+                "source_page": direction.evidence[0].page if direction.evidence else None,
+            }
+            for direction in extraction.directions
+            if not _is_empty_value(direction.value)
+        ],
+        "relevant_timelines": [
+            {"text": str(item.get("text")), "confidence": 0.72, "evidence_snippet": str(item.get("text"))}
+            for item in _as_list(extraction.legal_phrases.value)
+            if isinstance(item, dict) and item.get("type") == "timeline" and item.get("text")
+        ],
+        "confidence": max(
+            _safe_float(extraction.case_number.confidence),
+            _safe_float(extraction.court.confidence),
+            _safe_float(extraction.disposition.confidence),
+        ),
+    }
+
+
+def _best_field_snippet(*fields: ExtractedField) -> str | None:
+    for field in fields:
+        for evidence in getattr(field, "evidence", []) or []:
+            if evidence.snippet:
+                return evidence.snippet
+    return None
+
+
+def _llm_failure_fallback_package(
+    package: JudgmentReviewPackage,
+    *,
+    source_metadata: dict[str, Any],
+    reason: str,
+    review_mode: str,
+    stage_timings: list[dict[str, Any]],
+    llm_context: dict[str, Any],
+    llm_outputs: dict[str, Any],
+    model_name: str,
+) -> JudgmentReviewPackage:
+    package.source_metadata.update(source_metadata)
+    package.source_metadata.update(
+        {
+            "llm_review_mode": review_mode,
+            "llm_enabled": True,
+            "llm_used": False,
+            "llm_model": model_name,
+            "llm_fallback_reason": reason,
+            "llm_stage_timings": stage_timings,
+            "extraction_debug": {
+                "llm_context": llm_context,
+                "llm_outputs": llm_outputs,
+                "deterministic_package": serialize_review_package(package),
+            },
+        }
+    )
+    if reason not in package.risk_flags:
+        package.risk_flags.append(reason)
     return package
 
 
@@ -685,8 +858,19 @@ def _action_plan_prompt(
         "}\n"
         "Tough rules:\n"
         "- If the pages do not contain the final/operative order, set needs_more_context=true and action_items=[].\n"
+        "- Use the supplied context fully. Do not stop at the first dismissed/allowed/disposed sentence if the same "
+        "operative paragraph also orders deposit, payment, cross-examination, remand, transmission of records, "
+        "set-aside/modification of an order, or any dated listing.\n"
         "- Do not return an empty action plan when you have any final outcome, direction, dismissal, allowance, "
         "quashing, remand, bail liberty, or disposed application. Convert that outcome into a reviewable decision.\n"
+        "- If the operative text says an appeal/application is allowed and then states what follows, the action item "
+        "must be about the concrete consequence, not a generic appeal review.\n"
+        "- If the order says deposit/pay/compensation/enhanced compensation/interest/within weeks, create a "
+        "payment_release or direct_compliance item with the payer as responsible_department when visible.\n"
+        "- If the order says post/list/cross-examination/recall witness/transmit records, create a direct_compliance "
+        "or conditional_follow_up item with the date/timeline copied exactly.\n"
+        "- If the order says set aside/quash/remand/restore/modify, create a record_update or legal_review item that "
+        "names the affected order/case when visible.\n"
         "- Valid categories: direct_compliance, conditional_follow_up, legal_review, record_update, "
         "appeal_consideration, compliance, affidavit_report_filing, payment_release, reconsideration, "
         "no_operational_action.\n"
@@ -706,6 +890,9 @@ def _action_plan_prompt(
         "- confidence must reflect evidence quality. Use <=0.55 for unclear owner/timeline/evidence, "
         "0.56-0.80 for partial support, and >0.80 only when owner/action/timeline are clearly supported.\n"
         "- Keep titles short and executable: e.g. 'File compliance report', 'Release arrears', 'Reconsider application'.\n"
+        "- Titles must be judgment-specific. Include the case number, affected order, beneficiary, amount, or concrete "
+        "next step when visible. Avoid generic titles such as 'Review judgment outcome for appeal or compliance decision' "
+        "unless the context truly contains only a bare dismissal/allowance with no other operative consequence.\n"
         "- If owner or timeline is unclear, keep it null/missing and add ambiguity flags; do not guess.\n"
         f"- This is {'the second and final pass' if second_pass else 'the first pass over the last 3 pages'}.\n"
         f"case_details={json.dumps(case_details, ensure_ascii=True)}\n"
@@ -729,6 +916,16 @@ def _forced_action_plan_prompt(
         "create a no_operational_action decision item. If the order affects legal posture, records, bail, tribunal "
         "orders, compliance posture, or public-authority response, create legal_review, record_update, "
         "conditional_follow_up, appeal_consideration, or direct_compliance as appropriate.\n"
+        "Use the supplied action_context fully; do not stop at the first dismissed/allowed/disposed sentence when "
+        "the same final-order passage contains deposit, payment, compensation, cross-examination, recall witness, "
+        "remand, transmission of records, set-aside/modification, or a dated listing.\n"
+        "If the order allows an appeal/application and then states a concrete consequence, the item must describe "
+        "that consequence. Do not fall back to a generic review title when amount, case number, affected order, "
+        "beneficiary, hearing date, or next step is visible.\n"
+        "For payment/deposit/enhanced compensation/interest/within weeks, create payment_release or "
+        "direct_compliance with the payer as owner when visible. For posting/listing/cross-examination/recall "
+        "witness/transmit records, create direct_compliance or conditional_follow_up and copy the exact date/timeline. "
+        "Titles must be judgment-specific.\n"
         "Do not convert own-cost/no-cost clauses into notification, payment, or direct-compliance tasks.\n"
         "Each item must include title, responsible_department or null, category, priority, timeline, legal_basis, "
         "decision_reason, review_recommendation, requires_human_review, confidence, ambiguity_flags, and "
@@ -1585,11 +1782,11 @@ def _agentic_pdf_context(documents: list[Document], context_plan: dict[str, Any]
             context.append(item)
 
     for request in _context_plan_page_requests(context_plan, page_count):
-        context.extend(_documents_to_context(_select_pages(documents, start=request[0], end=request[1]), label="agentic_page_request"))
+        context.extend(_documents_to_context(_select_pages(documents, start=request[0], end=request[1]), label="agentic_page_request", limit=None))
 
     if not context:
         context.extend(_top_reranked_context(documents, CASE_DETAIL_QUERY, top_k=6))
-        context.extend(_documents_to_context(_select_last_pages(documents, page_count, count=3), label="agentic_default_last_pages"))
+        context.extend(_documents_to_context(_select_last_pages(documents, page_count, count=3), label="agentic_default_last_pages", limit=None))
 
     return _dedupe_context(context)[:8]
 
@@ -1691,13 +1888,13 @@ def _top_reranked_context(documents: list[Document], query: str, *, top_k: int) 
     return [_result_to_context(result, label="reranked_evidence") for result in index.search(query, top_k=top_k)]
 
 
-def _documents_to_context(documents: list[Document], *, label: str) -> list[dict[str, Any]]:
+def _documents_to_context(documents: list[Document], *, label: str, limit: int | None = 1200) -> list[dict[str, Any]]:
     return [
         {
             "label": label,
             "page": doc.metadata.get("page"),
             "chunk_id": doc.metadata.get("chunk_id"),
-            "text": _compact_text(doc.page_content or "", limit=1200),
+            "text": _context_text(doc.page_content or "", limit=limit),
         }
         for doc in documents
         if (doc.page_content or "").strip()
@@ -1787,7 +1984,7 @@ def _action_payload_needs_repair(payload: dict[str, Any]) -> bool:
 
 def _action_repair_context(documents: list[Document], page_count: int) -> list[dict[str, Any]]:
     if page_count <= 12:
-        return _documents_to_context(documents, label="whole_document_repair")
+        return _documents_to_context(documents, label="whole_document_repair", limit=None)
     selected: dict[tuple[int | None, str | None], Document] = {}
     candidate_docs = [
         *_select_pages(documents, start=1, end=2),
@@ -1802,7 +1999,7 @@ def _action_repair_context(documents: list[Document], page_count: int) -> list[d
     for doc in candidate_docs:
         metadata = doc.metadata or {}
         selected[(metadata.get("page"), metadata.get("chunk_id"))] = doc
-    return _documents_to_context(list(selected.values()), label="targeted_document_repair")
+    return _documents_to_context(list(selected.values()), label="targeted_document_repair", limit=None)
 
 
 def _merge_action_repair_payload(
@@ -2009,6 +2206,13 @@ def _normalise_risk_flags(value: Any) -> list[str]:
 
 def _compact_text(text: str, *, limit: int) -> str:
     clean = " ".join(text.split())
+    return clean[:limit]
+
+
+def _context_text(text: str, *, limit: int | None) -> str:
+    clean = " ".join(text.split())
+    if limit is None:
+        return clean
     return clean[:limit]
 
 

@@ -92,9 +92,63 @@ def test_judgment_repository_round_trip_and_dashboard_listing(workspace_tmp_path
         dashboard_records = await repository.list_dashboard_records("user-1")
         assert len(dashboard_records) == 1
         assert dashboard_records[0]["departments"] == ["Bruhat Bengaluru Mahanagara Palike"]
+        assert dashboard_records[0]["action_register"][0]["title"] == "Remove the encroachment"
+        assert dashboard_records[0]["action_register"][0]["owner"] == "Bruhat Bengaluru Mahanagara Palike"
+        assert dashboard_records[0]["action_register"][0]["status"] == "edited"
         await storage.close()
 
     asyncio.run(run())
+
+
+def test_dashboard_filter_uses_action_register_and_sanitizes_subject_owners():
+    from judgment_workflow.repository import JudgmentRepository, _clean_dashboard_owner, _missing_field_count
+
+    repository = JudgmentRepository(storage=None, canvas_app_id="test-app")
+    records = [
+        {
+            "case_number": "MFA No. 5400/1999",
+            "court": "High Court of Karnataka",
+            "record_id": "record-1",
+            "departments": ["Case reviewer", "Reference Court"],
+            "action_categories": ["appeal_consideration", "payment_release"],
+            "action_register": [
+                {
+                    "title": "Record condonation of delay",
+                    "owner": "Case reviewer",
+                    "category": "appeal_consideration",
+                },
+                {
+                    "title": "Deposit compensation before the Reference Court within 8 weeks",
+                    "owner": "Reference Court",
+                    "category": "payment_release",
+                }
+            ],
+        }
+    ]
+
+    assert _clean_dashboard_owner("delay in filing the appeal", "Delay be condoned") == "Case reviewer"
+    assert (
+        _clean_dashboard_owner("compensation", "Amount shall be deposited before the Reference Court")
+        == "Reference Court"
+    )
+    filtered = repository.filter_dashboard_records(records, department="reference court")
+    assert len(filtered) == 1
+    assert filtered[0]["departments"] == ["Reference Court"]
+    assert len(filtered[0]["action_register"]) == 1
+    assert filtered[0]["action_register"][0]["owner"] == "Reference Court"
+    assert repository.filter_dashboard_records(records, case_query="compensation") == records
+    payment_filtered = repository.filter_dashboard_records(records, action_type="payment_release")
+    assert len(payment_filtered[0]["action_register"]) == 1
+    assert repository.filter_dashboard_records(records, department="delay") == []
+    assert _missing_field_count(
+        {
+            "case_number": {"value": "MFA No. 5400/1999"},
+            "court": {"value": "High Court of Karnataka"},
+            "bench": {"value": []},
+            "case_type": {"value": "unknown"},
+            "directions": [],
+        }
+    ) == 2
 
 
 def test_repository_duplicate_detection_and_approval_guard(workspace_tmp_path: Path):
@@ -658,6 +712,24 @@ def test_vision_payload_parser_combines_action_description_and_accepts_fuzzy_rol
     assert result.evidence_pages["directions"] == 3
 
 
+def test_vision_prompt_uses_llm_extractor_schema():
+    from judgment_workflow.vision_extraction import _vision_prompt
+
+    prompt = _vision_prompt({"case_number": None}, [1, 2, 4])
+
+    assert '"case_type": null' in prompt
+    assert '"date_of_order": {"value": null' in prompt
+    assert '"parties_involved": {"petitioners": []' in prompt
+    assert '"key_directions_orders": [{"text": "...", "confidence": 0.0' in prompt
+    assert '"relevant_timelines": [{"text": "...", "confidence": 0.0' in prompt
+    assert '"verbatim_final_order_excerpt": null' in prompt
+    assert "An ORDER heading or 'made the following' sentence is not an operative direction by itself" in prompt
+    assert "same schema used by the text/LLM extractor" in prompt
+    assert "Do not truncate the operative order" in prompt
+    assert "compensation/payment/deposit" in prompt
+    assert "cross-examination" in prompt
+
+
 def test_vision_result_merge_overwrites_empty_primary_values():
     from judgment_workflow.vision_extraction import VisionExtractionResult, _merge_vision_result
 
@@ -676,12 +748,238 @@ def test_vision_result_merge_overwrites_empty_primary_values():
     assert target.fields["court"] == "High Court"
 
 
+def test_vision_missing_field_repair_prompt_names_all_missing_fields():
+    from judgment_workflow.vision_extraction import _vision_missing_fields_repair_prompt
+
+    prompt = _vision_missing_fields_repair_prompt(["case_number", "bench", "judgment_date"], [1, 2])
+
+    assert "case_number, bench, judgment_date" in prompt
+    assert '"case_number": null' in prompt
+    assert '"bench": []' in prompt
+    assert '"judgment_date": null' in prompt
+    assert "Do not infer values from the file name" in prompt
+
+
+def test_vision_missing_field_repair_payload_accepts_flat_and_nested_shapes():
+    from judgment_workflow.vision_extraction import result_from_vision_payload, _payload_from_missing_fields_repair
+
+    payload = _payload_from_missing_fields_repair(
+        ["case_number", "court", "bench", "judgment_date", "disposition"],
+        {
+            "case_number": "WA No.158/2009 (S-KSRTC)",
+            "case_details": {
+                "court": "IN THE HIGH COURT OF KARNATAKA AT BANGALORE",
+                "bench": ["Justice K.L. Manjunath", "Justice V. Suri Appa Rao"],
+                "disposition": "allowed",
+            },
+            "date_of_order": {"value": "13TH DAY OF SEPTEMBER 2012"},
+            "evidence_pages": {"case_number": 1, "court": 1, "bench": 1, "judgment_date": 1, "disposition": 11},
+        },
+    )
+    result = result_from_vision_payload(payload, provider="ollama_minicpm")
+
+    assert result.fields["case_number"] == "WA No.158/2009 (S-KSRTC)"
+    assert result.fields["court"] == "IN THE HIGH COURT OF KARNATAKA AT BANGALORE"
+    assert result.fields["bench"] == ["Justice K.L. Manjunath", "Justice V. Suri Appa Rao"]
+    assert result.fields["judgment_date"] == "13TH DAY OF SEPTEMBER 2012"
+    assert result.fields["disposition"] == "allowed"
+
+
+def test_vision_bench_repair_accepts_common_model_key_shapes():
+    from judgment_workflow.vision_extraction import result_from_vision_payload, _payload_from_field_repair
+
+    payload = _payload_from_field_repair(
+        "bench",
+        {
+            "field": "bench",
+            "bench": ["Justice V.P. Mohan Kumar"],
+            "raw_text": "THE HON'BLE MR. JUSTICE V.P. MOHAN KUMAR",
+            "evidence_snippet": "THE HON'BLE MR. JUSTICE V.P. MOHAN KUMAR",
+            "confidence": 0.92,
+            "page": 1,
+        },
+    )
+    result = result_from_vision_payload(payload, provider="ollama_minicpm")
+
+    assert result.fields["bench"] == ["Justice V.P. Mohan Kumar"]
+    assert result.evidence_pages["bench"] == 1
+
+
+def test_vision_metadata_field_repairs_accept_common_model_key_shapes():
+    from judgment_workflow.vision_extraction import result_from_vision_payload, _payload_from_field_repair
+
+    case_payload = _payload_from_field_repair(
+        "case_number",
+        {
+            "field": "case_number",
+            "case_number": "WA No.158/2009 (S-KSRTC)",
+            "raw_text": "WA No.158/2009 (S-KSRTC)",
+            "evidence_snippet": "WA No.158/2009 (S-KSRTC)",
+            "confidence": 0.9,
+            "page": 1,
+        },
+    )
+    court_payload = _payload_from_field_repair(
+        "court",
+        {
+            "court": "IN THE HIGH COURT OF KARNATAKA AT BANGALORE",
+            "page": 1,
+        },
+    )
+    date_payload = _payload_from_field_repair(
+        "judgment_date",
+        {
+            "judgment_date": "DATED THIS THE 13TH DAY OF SEPTEMBER 2012",
+            "page": 1,
+        },
+    )
+    disposition_payload = _payload_from_field_repair(
+        "disposition",
+        {
+            "disposition": "disposed",
+            "raw_text": "The writ petition is disposed of.",
+            "page": 4,
+        },
+    )
+
+    case_result = result_from_vision_payload(case_payload, provider="ollama_minicpm")
+    court_result = result_from_vision_payload(court_payload, provider="ollama_minicpm")
+    date_result = result_from_vision_payload(date_payload, provider="ollama_minicpm")
+    disposition_result = result_from_vision_payload(disposition_payload, provider="ollama_minicpm")
+
+    assert case_result.fields["case_number"] == "WA No.158/2009 (S-KSRTC)"
+    assert court_result.fields["court"] == "IN THE HIGH COURT OF KARNATAKA AT BANGALORE"
+    assert date_result.fields["judgment_date"] == "DATED THIS THE 13TH DAY OF SEPTEMBER 2012"
+    assert disposition_result.fields["disposition"] == "disposed"
+
+
+def test_vision_single_field_retry_is_limited_to_critical_header_fields():
+    from judgment_workflow.vision_extraction import (
+        _critical_vision_fields_needing_retry,
+        result_from_vision_payload,
+    )
+
+    result = result_from_vision_payload(
+        {
+            "case_details": {
+                "case_number": None,
+                "court": "High Court of Karnataka",
+                "bench": [],
+                "judgment_date": None,
+                "departments": [],
+                "advocates": [],
+                "disposition": "unknown",
+            }
+        }
+    )
+
+    assert _critical_vision_fields_needing_retry(result) == ["case_number", "bench", "judgment_date"]
+
+
 def test_vision_payload_parser_rejects_incomplete_case_number_labels():
     from judgment_workflow.vision_extraction import result_from_vision_payload
 
     result = result_from_vision_payload({"case_details": {"case_number": "WRIT PETITION NO."}})
 
     assert "case_number" not in result.fields
+
+
+def test_vision_payload_parser_does_not_treat_observed_judge_entity_as_department():
+    from judgment_workflow.vision_extraction import result_from_vision_payload
+
+    result = result_from_vision_payload(
+        {
+            "case_details": {
+                "case_number": "CIVIL REVISION PETITION NO.2982/1997",
+                "court": "High Court of Karnataka at Bangalore",
+                "responsible_entities": ["The Hon'ble Mr. Justice Y.Bhaskar Rao"],
+                "advocates": [{"name": "Sri T.Narayanaswamy, Adv.", "role": "Petitioner's Advocate"}],
+            },
+            "parties_involved": {
+                "petitioners": [{"name": "K.Nissar Ahmed"}],
+                "respondents": [{"name": "M/s.Karnataka Agro Industries Corp.Ltd."}],
+            },
+        }
+    )
+
+    assert "departments" not in result.fields
+    assert result.fields["advocates"] == ["Sri T.Narayanaswamy, Adv."]
+
+
+def test_vision_payload_parser_rejects_standalone_order_heading_as_direction():
+    from judgment_workflow.vision_extraction import result_from_vision_payload
+
+    result = result_from_vision_payload({"key_directions_orders": [{"text": "ORDER"}]})
+
+    assert result.directions == []
+
+
+def test_vision_payload_parser_keeps_respondent_organization_and_filters_advocate_roles():
+    from judgment_workflow.vision_extraction import result_from_vision_payload
+
+    result = result_from_vision_payload(
+        {
+            "case_details": {
+                "advocates": [
+                    {"name": "Sri.T.Narayanaswamy, Adv.", "role": "Petitioner"},
+                    {
+                        "name": "General Manager (P) and Secretary",
+                        "organization": "M/s.Karnataka Agro Industries Corp.Ltd.",
+                        "role": "Respondent",
+                    },
+                ]
+            },
+            "parties_involved": {
+                "petitioners": [{"name": "K.Nissar Ahmed"}],
+                "respondents": [{"organization": "M/s.Karnataka Agro Industries Corp.Ltd."}],
+            },
+        }
+    )
+
+    assert result.fields["advocates"] == ["Sri.T.Narayanaswamy, Adv."]
+    assert result.fields["respondents"] == ["M/s.Karnataka Agro Industries Corp.Ltd."]
+
+
+def test_vision_field_repair_targets_missing_bench_from_observed_wp16426_output():
+    from judgment_workflow.vision_extraction import _vision_fields_needing_repair, result_from_vision_payload
+
+    result = result_from_vision_payload(
+        {
+            "case_details": {
+                "case_number": "W.P.16426/96",
+                "case_type": "Civil Writ Petition",
+                "court": "High Court of Karnataka at Bangalore",
+                "bench": [],
+                "departments": [],
+                "responsible_entities": [],
+                "advocates": [
+                    {"name": "Smt Suman Hegde, Adv.", "role": "Petitioner"},
+                    {"name": "Sri N.S. Venugopal, Adv", "role": "Respondent"},
+                ],
+                "disposition": None,
+            },
+            "date_of_order": {"value": "18th June 1998", "raw_text": "DATED THIS THE 18TH DAY OF JUNE 1998"},
+            "parties_involved": {
+                "petitioners": [{"name": "Sufala Devidas Rane"}],
+                "respondents": [{"name": "Deputy Director, Department of Public Education, Karwar (U.K), Zilla Parishad"}],
+            },
+        }
+    )
+
+    assert _vision_fields_needing_repair(result) == ["bench", "departments", "disposition"]
+
+
+def test_vision_field_repair_prompt_is_single_field_and_schema_bound():
+    from judgment_workflow.vision_extraction import _vision_field_repair_prompt
+
+    prompt = _vision_field_repair_prompt("bench", [1, 2])
+
+    assert "Repair exactly one missing or weak field: bench" in prompt
+    assert '"field": "bench"' in prompt
+    assert '"value": []' in prompt
+    assert "Do not extract case_number" in prompt
+    assert "BEFORE THE HON'BLE" in prompt
+    assert "G.C.BHARUKA" not in prompt
 
 
 def test_configured_vision_extractor_supports_minicpm_gguf(monkeypatch):
@@ -703,11 +1001,12 @@ def test_configured_vision_extractor_supports_ollama(monkeypatch):
 
     monkeypatch.setenv("JUDGMENT_VISION_FALLBACK", "1")
     monkeypatch.setenv("JUDGMENT_VISION_PROVIDER", "ollama")
-    monkeypatch.setenv("OLLAMA_VISION_MODEL", "openbmb/minicpm-o2.6")
+    monkeypatch.setenv("OLLAMA_VISION_MODEL", "openbmb/minicpm-o2.6:latest")
 
     extractor = get_configured_vision_extractor()
 
     assert isinstance(extractor, OllamaVisionExtractor)
+    assert extractor.model == "openbmb/minicpm-o2.6:latest"
 
 
 def test_configured_vision_extractor_supports_lmstudio(monkeypatch):
@@ -812,6 +1111,69 @@ def test_llm_first_workflow_uses_case_context_and_second_action_pass():
     assert package.action_items[0].category == "direct_compliance"
     assert package.action_items[0].decision_reason
     assert package.action_items[0].evidence[0].extraction_method == "llm_first"
+
+
+def test_llm_first_workflow_skips_case_details_when_vision_fields_are_strong():
+    from judgment_workflow.llm_review_workflow import build_llm_first_review_package
+
+    documents = [
+        Document(
+            page_content=(
+                "VISION OCR STRUCTURED TEXT\n"
+                "case_number: Writ Petition No. 1234 of 2025.\n"
+                "case_type: Writ Petition.\n"
+                "IN THE HIGH COURT OF KARNATAKA AT BENGALURU.\n"
+                "judgment_date: 2026-03-15.\n"
+                "disposition: allowed.\n"
+                "BEFORE THE HON'BLE MR. JUSTICE A. EXAMPLE.\n"
+                "petitioners: ABC Residents Association.\n"
+                "respondents: State of Karnataka, BBMP.\n"
+                "VISION OCR ACTION CONTEXT.\n"
+                "Final order follows.\n"
+                "The BBMP is directed to remove the encroachment within four weeks."
+            ),
+            metadata={
+                "source": "vision.pdf",
+                "page": 1,
+                "chunk_id": "vision-ocr-p1",
+                "source_quality": "vision_ocr",
+                "extraction_method": "vision_ocr",
+            },
+        )
+    ]
+    prompts = []
+
+    def fake_llm(prompt: str) -> str:
+        prompts.append(prompt)
+        assert "extracting only high-confidence case metadata" not in prompt
+        assert "previous case-detail extraction failed" not in prompt
+        assert "Writ Petition No. 1234 of 2025" in prompt
+        return (
+            '{"context_summary":"Final order directs BBMP to remove encroachment.",'
+            '"needs_more_context":false,"action_items":[{'
+            '"title":"Remove encroachment for Writ Petition No. 1234 of 2025",'
+            '"responsible_department":"BBMP","category":"direct_compliance","priority":"high",'
+            '"timeline":{"raw_text":"within four weeks","timeline_type":"explicit","confidence":0.82},'
+            '"legal_basis":"The BBMP is directed to remove the encroachment within four weeks.",'
+            '"decision_reason":"The final order directly directs BBMP to remove the encroachment.",'
+            '"review_recommendation":"Verify deadline and owner before publishing.",'
+            '"requires_human_review":true,"confidence":0.9,"ambiguity_flags":[],'
+            '"evidence_snippet":"The BBMP is directed to remove the encroachment within four weeks."}]}'
+        )
+
+    package = asyncio.run(
+        build_llm_first_review_package(
+            documents,
+            {"source_system": "test", "ocr_routing": "vision_ocr_only"},
+            pdf_profile={"page_count": 1, "profile_type": "scanned"},
+            llm_callable=fake_llm,
+        )
+    )
+
+    assert len(prompts) == 1
+    assert package.extraction.case_number.value == "Writ Petition No. 1234 of 2025"
+    assert package.source_metadata["llm_case_details_source"] == "deterministic_vision_ocr"
+    assert package.action_items[0].title == "Remove encroachment for Writ Petition No. 1234 of 2025"
 
 
 def test_llm_first_workflow_does_not_copy_deterministic_department_noise():
@@ -1485,6 +1847,40 @@ def test_llm_first_uses_deterministic_action_fallback_when_action_llm_returns_em
     assert package.action_items
 
 
+def test_llm_first_uses_deterministic_fallback_when_case_details_fail():
+    from judgment_workflow.llm_review_workflow import build_llm_first_review_package
+
+    documents = [
+        Document(
+            page_content=(
+                "IN THE HIGH COURT OF KARNATAKA AT BANGALORE\n"
+                "DATED THIS THE 6TH DAY OF JANUARY 1998\n"
+                "BEFORE THE HON'BLE MR. JUSTICE KUMAR RAJARATNAM\n"
+                "CRIMINAL PETITION NO.2268 OF 1997\n"
+                "The petition is dismissed."
+            ),
+            metadata={"source": "judgment.pdf", "page": 1, "chunk_id": "p1"},
+        )
+    ]
+
+    def fake_llm(prompt: str) -> str:
+        return "{}"
+
+    package = asyncio.run(
+        build_llm_first_review_package(
+            documents,
+            {"source_system": "test"},
+            pdf_profile={"page_count": 1},
+            llm_callable=fake_llm,
+        )
+    )
+
+    assert package.source_metadata["llm_review_mode"] == "deterministic_after_llm_case_detail_failure"
+    assert "llm_case_details_failed" in package.risk_flags
+    assert package.source_metadata["llm_used"] is False
+    assert "deterministic_package" in package.source_metadata["extraction_debug"]
+
+
 def test_llm_first_repairs_empty_date_and_advocates_when_last_page_has_them():
     from judgment_workflow.llm_review_workflow import build_llm_first_review_package
 
@@ -1627,6 +2023,59 @@ def test_llm_json_parser_accepts_fenced_json():
 
     assert _parse_llm_json_object('```json\n{"ok": true}\n```') == {"ok": True}
     assert _parse_llm_json_object('Here is the JSON:\n{"ok": true}\nDone') == {"ok": True}
+
+
+def test_llm_action_context_can_preserve_full_final_order_text():
+    from judgment_workflow.llm_review_workflow import _documents_to_context
+
+    prefix = "Background sentence. " * 130
+    final_order = (
+        "ORDER: The appeal is allowed in part. The insurer shall deposit enhanced compensation "
+        "of Rs. 3,65,013 with interest within six weeks and the Registry shall transmit records."
+    )
+
+    context = _documents_to_context(
+        [Document(page_content=prefix + final_order, metadata={"page": 12, "chunk_id": "p12"})],
+        label="final_pages",
+        limit=None,
+    )
+
+    assert final_order in context[0]["text"]
+
+
+def test_llm_action_prompts_reject_generic_titles_when_concrete_order_exists():
+    from judgment_workflow.llm_review_workflow import _action_plan_prompt, _forced_action_plan_prompt
+
+    action_context = [
+        {
+            "label": "final_pages",
+            "text": (
+                "The application is allowed. PW-1 is recalled for cross-examination and the matter shall be "
+                "posted before the Central Project Coordinator and District Judge on 26.10.2009."
+            ),
+            "page": 3,
+            "chunk_id": "p3",
+        }
+    ]
+    case_details = {"case_number": "Company Application No. 10 of 2009"}
+
+    first_prompt = _action_plan_prompt(
+        action_context=action_context,
+        supporting_context=[],
+        case_details=case_details,
+    )
+    forced_prompt = _forced_action_plan_prompt(
+        action_context=action_context,
+        supporting_context=[],
+        case_details=case_details,
+        previous_payload={"action_items": []},
+    )
+
+    for prompt in (first_prompt, forced_prompt):
+        assert "generic" in prompt.lower()
+        assert "cross-examination" in prompt
+        assert "26.10.2009" in prompt
+        assert "judgment-specific" in prompt
 
 
 def test_llm_source_confidence_is_match_based_not_hardcoded():
@@ -2391,6 +2840,571 @@ def test_generate_highlighted_pdf_is_standalone(workspace_tmp_path: Path):
         highlighted_doc.close()
 
 
+def test_highlighted_page_endpoint_generates_deferred_pdf(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import api as judgment_api
+    from judgment_workflow.api import judgment_router
+
+    source_pdf = workspace_tmp_path / "source-lazy.pdf"
+    highlighted_pdf = workspace_tmp_path / "records" / "record-lazy" / "highlighted.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "The BBMP is directed to remove the encroachment within four weeks.")
+    doc.save(source_pdf)
+    doc.close()
+
+    record = {
+        "record_id": "record-lazy",
+        "user_id": "reviewer",
+        "original_pdf_path": str(source_pdf),
+        "highlighted_pdf_path": str(highlighted_pdf),
+        "pdf_profile": {"page_count": 1},
+        "extraction": {
+            "directions": [
+                {
+                    "evidence": [
+                        {
+                            "page": 1,
+                            "snippet": "BBMP is directed to remove the encroachment",
+                            "extraction_method": "deterministic",
+                        }
+                    ]
+                }
+            ]
+        },
+        "action_items": [],
+    }
+    metadata_updates = []
+
+    class FakeRepository:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get_record(self, user_id, record_id):
+            assert user_id == "reviewer"
+            assert record_id == "record-lazy"
+            return record
+
+        async def update_record_metadata(self, user_id, record_id, **kwargs):
+            metadata_updates.append(kwargs)
+            record.update(kwargs)
+
+    monkeypatch.setattr(judgment_api, "JudgmentRepository", FakeRepository)
+    monkeypatch.setattr(judgment_api, "get_storage", lambda: None)
+
+    app = FastAPI()
+    app.include_router(judgment_router)
+    client = TestClient(app)
+
+    response = client.get("/judgments/record-lazy/highlighted-page/1?user_id=reviewer")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\x89PNG")
+    assert highlighted_pdf.exists()
+    assert metadata_updates == [{"highlighted_pdf_path": str(highlighted_pdf)}]
+
+
+def test_process_judgment_file_defers_highlight_generation(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+
+    source_pdf = workspace_tmp_path / "source-deferred.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text(
+        (72, 72),
+        "IN THE HIGH COURT OF KARNATAKA AT BENGALURU. "
+        "Writ Petition No. 1234 of 2025. "
+        "The BBMP is directed to remove the encroachment within four weeks.",
+    )
+    doc.save(source_pdf)
+    doc.close()
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "deferred.db"))
+    )
+    asyncio.run(storage.initialize())
+
+    monkeypatch.setattr(judgment_pipeline, "JUDGMENT_DATA_ROOT", workspace_tmp_path / "judgments")
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(source_pdf),
+                record_id="record-deferred",
+                original_file_name=source_pdf.name,
+                source_metadata={"source_system": "test"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                llm_enabled=False,
+                processing_mode="test",
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    highlighted_path = Path(record["highlighted_pdf_path"])
+    assert highlighted_path.name == "highlighted.pdf"
+    assert not highlighted_path.exists()
+    assert record["source_metadata"]["highlight_generation_mode"] == "deferred"
+
+
+def test_process_judgment_file_replays_cached_hash_before_expensive_extraction(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "cache-replay.db"))
+    )
+    asyncio.run(storage.initialize())
+    pdf_path = workspace_tmp_path / "source.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%cache-test\n")
+    progress_stages = []
+
+    class CacheRepository:
+        def __init__(self, storage, canvas_app_id):
+            pass
+
+        async def find_duplicate_candidates(self, user_id, document_hash, *, exclude_record_id=None):
+            return []
+
+        async def get_cached_record_by_hash(self, user_id, document_hash, *, exclude_record_id=None):
+            return {
+                "record_id": "cached-record",
+                "user_id": user_id,
+                "review_status": "approved",
+                "extraction": {
+                    "case_number": {"value": "WP No. 1/1998", "evidence": []},
+                    "court": {"value": "High Court of Karnataka", "evidence": []},
+                    "judgment_date": {"value": "1998-01-01", "evidence": []},
+                },
+                "action_items": [
+                    {
+                        "action_id": "action-0",
+                        "title": "Record dismissal",
+                        "responsible_department": "Case reviewer",
+                        "category": "no_immediate_action",
+                        "timeline": {"raw_text": None, "due_date": None, "timeline_type": "missing"},
+                        "evidence": [],
+                        "status": "approved",
+                    }
+                ],
+                "source_metadata": {"ocr_routing": "vision_ocr_only", "vision_pages": [1]},
+                "risk_flags": [],
+                "overall_confidence": 0.9,
+                "pdf_profile": {"page_count": 1, "ocr_used": True},
+                "processing_metrics": {"processing_ms": 123, "extraction_methods": {"vision_ocr": 1}},
+            }
+
+        async def create_record_from_cache(self, **kwargs):
+            cached = dict(kwargs["cached_record"])
+            cached["record_id"] = kwargs["record_id"]
+            cached["source_metadata"] = {
+                **cached.get("source_metadata", {}),
+                **kwargs["source_metadata"],
+                "cache_replay": True,
+                "cache_source_record_id": kwargs["cached_record"]["record_id"],
+            }
+            return cached
+
+        async def update_record_metadata(self, user_id, record_id, **updates):
+            return {
+                "record_id": record_id,
+                "source_metadata": {"cache_replay": True, "cache_source_record_id": "cached-record"},
+                **updates,
+            }
+
+    monkeypatch.setattr(judgment_pipeline, "JudgmentRepository", CacheRepository)
+    monkeypatch.setattr(judgment_pipeline, "compute_document_hash", lambda path: "same-hash")
+    monkeypatch.setattr(judgment_pipeline, "detect_ocr_need", lambda path: {"needs_ocr": False, "page_count": 1, "text_layer_reliable": True})
+    monkeypatch.setattr(
+        judgment_pipeline,
+        "extract_layered_pdf_documents",
+        lambda path: pytest.fail("cached upload should not run document extraction"),
+    )
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(pdf_path),
+                record_id="record-replay",
+                original_file_name="source.pdf",
+                source_metadata={"source_system": "manual_upload"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                progress_callback=lambda **event: progress_stages.append(event["stage"]),
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    assert record["processing_metrics"]["cache_hit"] is True
+    assert record["processing_metrics"]["cache_source_record_id"] == "cached-record"
+    assert progress_stages == [
+        "judgment_processing",
+        "ocr_detection",
+        "judgment_extraction",
+        "highlight_generation",
+        "record_storage",
+        "complete",
+    ]
+
+
+def test_process_judgment_file_reuses_ocr_detection_for_profile(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import document_profile, pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+
+    calls = {"detect": 0}
+
+    def fake_detect_ocr_need(pdf_path):
+        calls["detect"] += 1
+        return {
+            "needs_ocr": False,
+            "page_count": 2,
+            "sparse_pages": [],
+            "total_text_chars": 180,
+            "ocr_available": False,
+        }
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "single-profile-pass.db"))
+    )
+    asyncio.run(storage.initialize())
+
+    monkeypatch.setattr(judgment_pipeline, "JUDGMENT_DATA_ROOT", workspace_tmp_path / "judgments")
+    monkeypatch.setattr(judgment_pipeline, "compute_document_hash", lambda pdf_path: "hash-single-pass")
+    monkeypatch.setattr(judgment_pipeline, "extract_layered_pdf_documents", lambda pdf_path: _sample_documents())
+    monkeypatch.setattr(judgment_pipeline, "detect_ocr_need", fake_detect_ocr_need)
+    monkeypatch.setattr(document_profile, "detect_ocr_need", fake_detect_ocr_need)
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(workspace_tmp_path / "source.pdf"),
+                record_id="record-single-profile-pass",
+                original_file_name="source.pdf",
+                source_metadata={"source_system": "test"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                llm_enabled=False,
+                processing_mode="test",
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    assert calls["detect"] == 1
+    assert record["pdf_profile"]["profile_type"] == "digital"
+    assert record["pdf_profile"]["total_text_chars"] == 180
+
+
+def test_detect_ocr_need_flags_corrupted_embedded_text(workspace_tmp_path: Path):
+    from judgment_workflow.ocr import detect_ocr_need
+
+    pdf_path = workspace_tmp_path / "corrupted-text-layer.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text(
+        (72, 72),
+        "0 IN tat n0R00PS CF KLNa2dAAtbA:i3L.CLL "
+        "wP.no lqj qj1997 c/w :: ; ;: ee ee "
+        "By thls Ccurt ar the respondents 1 and 2",
+    )
+    doc.save(pdf_path)
+    doc.close()
+
+    result = detect_ocr_need(str(pdf_path), min_text_chars_per_page=20)
+
+    assert result["needs_ocr"] is True
+    assert result["text_layer_reliable"] is False
+    assert result["unreliable_text_pages"] == [1]
+
+
+def test_process_judgment_file_uses_minicpm_vision_ocr_only_for_corrupted_text_layer(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+    from judgment_workflow.vision_extraction import VisionExtractionResult
+
+    def fake_detect_ocr_need(pdf_path):
+        return {
+            "needs_ocr": True,
+            "page_count": 1,
+            "sparse_pages": [],
+            "unreliable_text_pages": [1],
+            "total_text_chars": 140,
+            "text_layer_reliable": False,
+            "ocr_available": True,
+        }
+
+    class FakeMiniCPMExtractor:
+        model = "openbmb/minicpm-o2.6:latest"
+
+        async def extract(self, *, pdf_path, pages, deterministic_summary):
+            assert pages == [1]
+            return VisionExtractionResult(
+                fields={
+                    "case_number": "Writ Petition No. 1234 of 2025",
+                    "court": "High Court of Karnataka at Bengaluru",
+                },
+                directions=["The BBMP is directed to remove the encroachment within four weeks."],
+                evidence_pages={"case_number": 1, "court": 1, "directions": 1},
+                raw_json={"provider": "fake-minicpm"},
+                provider="ollama_minicpm",
+            )
+
+    bad_text_documents = [
+        Document(
+            page_content="0 IN tat n0R00PS CF KLNa2dAAtbA:i3L.CLL wP.no lqj qj1997",
+            metadata={"source": "source.pdf", "page": 1, "chunk_id": "bad-p1"},
+        )
+    ]
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "ocr-only-routing.db"))
+    )
+    asyncio.run(storage.initialize())
+
+    monkeypatch.setattr(judgment_pipeline, "JUDGMENT_DATA_ROOT", workspace_tmp_path / "judgments")
+    monkeypatch.setattr(judgment_pipeline, "compute_document_hash", lambda pdf_path: "hash-ocr-only-routing")
+    monkeypatch.setattr(judgment_pipeline, "detect_ocr_need", fake_detect_ocr_need)
+    monkeypatch.setattr(judgment_pipeline, "extract_layered_pdf_documents", lambda pdf_path: bad_text_documents)
+    monkeypatch.setattr(judgment_pipeline, "ocr_pdf_with_tesseract", lambda pdf_path, target_pages=None: pytest.fail("Tesseract OCR should not run for corrupted text-layer PDFs"))
+    monkeypatch.setattr(judgment_pipeline, "get_configured_vision_extractor", lambda **kwargs: FakeMiniCPMExtractor())
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(workspace_tmp_path / "source.pdf"),
+                record_id="record-ocr-only-routing",
+                original_file_name="source.pdf",
+                source_metadata={"source_system": "test"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                llm_enabled=False,
+                processing_mode="test",
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    assert record["source_metadata"]["text_layer_rejected"] is True
+    assert record["source_metadata"]["ocr_routing"] == "vision_ocr_only"
+    assert record["source_metadata"]["vision_ocr_model"] == "openbmb/minicpm-o2.6:latest"
+    assert record["pdf_profile"]["profile_type"] == "ocr_required"
+    assert record["extraction"]["case_number"]["value"] == "Writ Petition No. 1234 of 2025"
+    assert record["processing_metrics"]["extraction_methods"] == {"vision_ocr": 1}
+    assert "ocr_review_required" not in record["risk_flags"]
+    assert "ocr_unavailable" not in record["risk_flags"]
+
+
+def test_process_judgment_file_does_not_500_when_vision_ocr_times_out(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+
+    def fake_detect_ocr_need(pdf_path):
+        return {
+            "needs_ocr": True,
+            "page_count": 1,
+            "sparse_pages": [],
+            "unreliable_text_pages": [1],
+            "total_text_chars": 140,
+            "text_layer_reliable": False,
+            "ocr_available": True,
+        }
+
+    class TimeoutMiniCPMExtractor:
+        model = "openbmb/minicpm-o2.6:latest"
+
+        async def extract(self, *, pdf_path, pages, deterministic_summary):
+            raise TimeoutError("timed out")
+
+    bad_text_documents = [
+        Document(
+            page_content=(
+                "0 IN tat n0R00PS CF KLNa2dAAtbA:i3L.CLL wP.no lqj qj1997 "
+                "respondents shall comply"
+            ),
+            metadata={"source": "source.pdf", "page": 1, "chunk_id": "bad-p1"},
+        )
+    ]
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "vision-timeout.db"))
+    )
+    asyncio.run(storage.initialize())
+
+    monkeypatch.setattr(judgment_pipeline, "JUDGMENT_DATA_ROOT", workspace_tmp_path / "judgments")
+    monkeypatch.setattr(judgment_pipeline, "compute_document_hash", lambda pdf_path: "hash-vision-timeout")
+    monkeypatch.setattr(judgment_pipeline, "detect_ocr_need", fake_detect_ocr_need)
+    monkeypatch.setattr(judgment_pipeline, "extract_layered_pdf_documents", lambda pdf_path: bad_text_documents)
+    monkeypatch.setattr(judgment_pipeline, "ocr_pdf_with_tesseract", lambda pdf_path, target_pages=None: [])
+    monkeypatch.setattr(judgment_pipeline, "get_configured_vision_extractor", lambda **kwargs: TimeoutMiniCPMExtractor())
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(workspace_tmp_path / "source.pdf"),
+                record_id="record-vision-timeout",
+                original_file_name="source.pdf",
+                source_metadata={"source_system": "test"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                llm_enabled=False,
+                processing_mode="test",
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    assert record["source_metadata"]["vision_failure_stage"] == "vision_ocr_extraction"
+    assert "timed out" in record["source_metadata"]["vision_error"]
+    assert record["source_metadata"]["vision_fallback_used"] is False
+    assert "ocr_review_required" in record["risk_flags"]
+
+
+def test_process_judgment_file_passes_vision_ocr_context_to_llm_for_corrupted_text(monkeypatch, workspace_tmp_path: Path):
+    from judgment_workflow import pipeline as judgment_pipeline
+    from judgment_workflow.pipeline import process_judgment_file
+    from judgment_workflow.vision_extraction import VisionExtractionResult
+
+    def fake_detect_ocr_need(pdf_path):
+        return {
+            "needs_ocr": True,
+            "page_count": 2,
+            "sparse_pages": [],
+            "unreliable_text_pages": [1, 2],
+            "total_text_chars": 240,
+            "text_layer_reliable": False,
+            "ocr_available": False,
+        }
+
+    class FakeMiniCPMExtractor:
+        model = "openbmb/minicpm-o2.6:latest"
+
+        async def extract(self, *, pdf_path, pages, deterministic_summary):
+            assert pages == [1, 2]
+            return VisionExtractionResult(
+                fields={
+                    "case_number": "CIVIL REVISION PETITION NO.2982/1997",
+                    "case_type": "Civil Revision Petition",
+                    "court": "High Court of Karnataka at Bangalore",
+                    "bench": ["Justice Y. Bhaskar Rao"],
+                    "judgment_date": "16TH DAY OF JANUARY, 1998",
+                    "advocates": ["Sri.T.Narayanaswamy, Adv."],
+                },
+                directions=["The petition is dismissed."],
+                evidence_pages={"case_number": 1, "court": 1, "directions": 2},
+                raw_json={
+                    "case_details": {
+                        "case_number": "CIVIL REVISION PETITION NO.2982/1997",
+                        "case_type": "Civil Revision Petition",
+                        "court": "High Court of Karnataka at Bangalore",
+                    },
+                    "date_of_order": {"raw_text": "DATED THE 16TH DAY OF JANUARY, 1998"},
+                    "key_directions_orders": [{"text": "The petition is dismissed.", "source_page": 2}],
+                },
+                provider="ollama_minicpm",
+            )
+
+    bad_text_documents = [
+        Document(
+            page_content="0 IN tat n0R00PS CF KLNa2dAAtbA:i3L.CLL wP.no lqj qj1997",
+            metadata={"source": "source.pdf", "page": 1, "chunk_id": "bad-p1"},
+        )
+    ]
+    llm_seen = {}
+
+    async def fake_build_llm_first_review_package(documents, case_metadata, *, pdf_profile=None, **kwargs):
+        llm_seen["texts"] = [doc.page_content for doc in documents]
+        llm_seen["metadata"] = [dict(doc.metadata or {}) for doc in documents]
+        assert any("case_number: CIVIL REVISION PETITION NO.2982/1997" in text for text in llm_seen["texts"])
+        assert not any('"case_details"' in text for text in llm_seen["texts"])
+        assert not any("KLNa2dAAtbA" in text for text in llm_seen["texts"])
+        return build_judgment_review_package(documents, case_metadata)
+
+    storage = get_storage_backend(
+        StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "vision-to-llm.db"))
+    )
+    asyncio.run(storage.initialize())
+
+    monkeypatch.setattr(judgment_pipeline, "JUDGMENT_DATA_ROOT", workspace_tmp_path / "judgments")
+    monkeypatch.setattr(judgment_pipeline, "compute_document_hash", lambda pdf_path: "hash-vision-to-llm")
+    monkeypatch.setattr(judgment_pipeline, "detect_ocr_need", fake_detect_ocr_need)
+    monkeypatch.setattr(judgment_pipeline, "extract_layered_pdf_documents", lambda pdf_path: bad_text_documents)
+    monkeypatch.setattr(judgment_pipeline, "get_configured_vision_extractor", lambda **kwargs: FakeMiniCPMExtractor())
+    monkeypatch.setattr(judgment_pipeline, "build_llm_first_review_package", fake_build_llm_first_review_package)
+
+    try:
+        record = asyncio.run(
+            process_judgment_file(
+                user_id="user-1",
+                pdf_path=str(workspace_tmp_path / "source.pdf"),
+                record_id="record-vision-to-llm",
+                original_file_name="source.pdf",
+                source_metadata={"source_system": "test"},
+                storage=storage,
+                canvas_app_id="theme11-local",
+                llm_enabled=True,
+                processing_mode="test",
+            )
+        )
+    finally:
+        asyncio.run(storage.close())
+
+    assert llm_seen["metadata"][0]["extraction_method"] == "vision_ocr"
+    assert record["source_metadata"]["ocr_routing"] == "vision_ocr_only"
+    assert record["source_metadata"]["vision_fallback_used"] is True
+
+
+def test_vision_result_documents_front_loads_full_action_context():
+    from judgment_workflow.pipeline import _vision_result_documents
+    from judgment_workflow.vision_extraction import VisionExtractionResult
+
+    result = VisionExtractionResult(
+        fields={"case_number": "MFA No. 1 of 2020"},
+        directions=[
+            "The appeal is allowed in part.",
+            "The insurer shall deposit enhanced compensation of Rs. 3,65,013 within six weeks.",
+        ],
+        evidence_pages={"directions": 9},
+        raw_json={
+            "verbatim_final_order_excerpt": (
+                "The appeal is allowed in part. The insurer shall deposit enhanced compensation "
+                "of Rs. 3,65,013 within six weeks."
+            ),
+            "key_directions_orders": [
+                {"text": "The insurer shall deposit enhanced compensation of Rs. 3,65,013 within six weeks."}
+            ],
+            "relevant_timelines": [{"text": "within six weeks"}],
+        },
+    )
+
+    documents = _vision_result_documents(
+        result,
+        pdf_path="scan.pdf",
+        original_file_name=None,
+        source_metadata={},
+        pdf_profile={"profile_type": "scanned"},
+    )
+
+    text = documents[0].page_content
+    assert "VISION OCR ACTION CONTEXT" in text
+    assert "final_order_excerpt" in text
+    assert "Rs. 3,65,013 within six weeks" in text
+    assert '"key_directions_orders"' not in text
+    assert '"name":' not in text
+
+    package = build_judgment_review_package(documents, {})
+    titles = [item.title for item in package.action_items]
+    assert "Deposit enhanced compensation of Rs. 3,65,013" in titles
+    assert not any(title.startswith("VISION OCR") or "operative directions:" in title for title in titles)
+
+
 def test_judgment_evidence_index_retrieves_and_reranks_legal_evidence():
     from rag.judgment.retrieval import JudgmentEvidenceIndex
 
@@ -2458,7 +3472,7 @@ def test_duplicate_detection_finds_case_metadata_near_match(workspace_tmp_path: 
 
 
 def test_metrics_summarize_evidence_review_and_duplicate_state(workspace_tmp_path: Path):
-    from judgment_workflow.metrics import build_record_metrics
+    from judgment_workflow.metrics import build_dashboard_metrics, build_record_metrics
     from judgment_workflow.serialization import serialize_review_package
 
     package = build_judgment_review_package(_sample_documents())
@@ -2483,6 +3497,32 @@ def test_metrics_summarize_evidence_review_and_duplicate_state(workspace_tmp_pat
     assert metrics["review_edit_count"] == 2
     assert metrics["duplicate_count"] == 1
     assert metrics["ocr_used"] is True
+    assert build_dashboard_metrics([{"metrics": metrics}])["ocr_used"] is True
+
+
+def test_metrics_treat_vision_ocr_as_ocr_used():
+    from judgment_workflow.metrics import build_dashboard_metrics, build_record_metrics
+
+    record = {
+        "record_id": "record-vision",
+        "extraction": {},
+        "action_items": [],
+        "pdf_profile": {"page_count": 4, "ocr_used": False},
+        "source_metadata": {
+            "ocr_routing": "vision_ocr_only",
+            "vision_pages": [1, 2],
+        },
+        "processing_metrics": {"extraction_methods": {"vision_ocr": 2}},
+    }
+
+    metrics = build_record_metrics(record)
+
+    assert metrics["ocr_used"] is True
+    assert metrics["vision_ocr_used"] is True
+    assert metrics["ocr_pages"] == [1, 2]
+    dashboard_metrics = build_dashboard_metrics([{"metrics": metrics}])
+    assert dashboard_metrics["ocr_used"] is True
+    assert dashboard_metrics["vision_ocr_used"] is True
 
 
 def test_detect_scanned_pdf_flags_image_only_pages(workspace_tmp_path: Path):
@@ -2624,6 +3664,36 @@ def test_evaluate_endpoint_returns_clean_review_schema(monkeypatch, workspace_tm
     assert payload["action_plan"]["items"][0]["owner"] == "BBMP"
     assert payload["quality"]["metrics"]["evidence_coverage_percent"] == 100
     assert "record" not in payload
+
+
+def test_upload_endpoint_sanitizes_user_id_before_writing_pdf(monkeypatch, workspace_tmp_path):
+    from judgment_workflow import api as judgment_api
+    from judgment_workflow.api import judgment_router
+
+    data_root = workspace_tmp_path / "judgment_data"
+    captured = {}
+
+    async def fake_process_judgment_file(**kwargs):
+        captured.update(kwargs)
+        return {"record_id": kwargs["record_id"], "user_id": kwargs["user_id"]}
+
+    monkeypatch.setattr(judgment_api, "JUDGMENT_DATA_ROOT", data_root)
+    monkeypatch.setattr(judgment_api, "process_judgment_file", fake_process_judgment_file)
+    monkeypatch.setattr(judgment_api, "get_storage", lambda: None)
+
+    app = FastAPI()
+    app.include_router(judgment_router)
+    client = TestClient(app)
+
+    response = client.post(
+        "/judgments/upload?sync=true",
+        data={"user_id": "../demo reviewer"},
+        files={"file": ("sample.pdf", b"%PDF-1.4\n%", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert captured["user_id"] == "demo_reviewer"
+    assert Path(captured["pdf_path"]).resolve().is_relative_to(data_root.resolve())
 
 
 def test_upload_progress_endpoint_reports_real_pipeline_stages(monkeypatch):

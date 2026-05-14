@@ -78,6 +78,59 @@ function humanize(value) {
         .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
+function humanizeAuditLabel(value) {
+    const labels = {
+        action_update: "Action Updated",
+        duplicate_resolution: "Duplicate Resolved",
+        field_update: "Field Updated",
+        record_created: "Record Created",
+        review_decision: "Review Decision",
+        use_existing: "Use Existing",
+        keep_both: "Keep Both",
+        ai_value_wrong: "AI value wrong",
+        missing_or_empty: "Missing or empty",
+        source_verified: "Source verified",
+        ambiguous_source: "Ambiguous source",
+        format_cleanup: "Format cleanup",
+        manual_correction: "Manual correction",
+        pending_review: "Pending Review",
+        needs_clarification: "Needs Clarification",
+    };
+    const key = String(value || "").trim();
+    if (labels[key]) return labels[key];
+    if (/^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(key)) return humanize(key);
+    return key;
+}
+
+function formatAuditValue(value) {
+    if (value === null || value === undefined || value === "") return "";
+    if (Array.isArray(value)) {
+        return value.map(formatAuditValue).filter(Boolean).join(", ");
+    }
+    if (typeof value === "object") {
+        const phrase = value.phrase || value.text || value.label || value.value || value.status || value.type || value.category;
+        if (phrase) return formatAuditValue(phrase);
+        return Object.entries(value)
+            .filter(([, item]) => item !== null && item !== undefined && item !== "")
+            .map(([key, item]) => `${humanizeAuditLabel(key)}: ${formatAuditValue(item)}`)
+            .join("; ");
+    }
+    return humanizeAuditLabel(value);
+}
+
+function auditSummaryValue(payload) {
+    if (!payload || typeof payload !== "object") return payload;
+    if (payload.value !== undefined) return payload.value;
+    if (payload.status !== undefined) return payload.status;
+    if (payload.title !== undefined) {
+        const owner = payload.responsible_department || payload.owner || payload.department;
+        return owner ? `${payload.title} (${owner})` : payload.title;
+    }
+    if (payload.responsible_department !== undefined) return payload.responsible_department;
+    if (payload.reason !== undefined) return payload.reason;
+    return "";
+}
+
 function formatValue(value) {
     if (value === null || value === undefined || value === "") return "";
     if (Array.isArray(value)) {
@@ -184,6 +237,7 @@ function formatInlineList(values, fallback = "None") {
 function riskSeverity(flag) {
     const text = String(flag || "").toLowerCase();
     if (!text || text === "none") return "low";
+    if (text === "llm_case_details_failed") return "medium";
     if (/(missing|unsupported|failed|error|critical|overdue|no source|owner unclear|court|deadline|department)/.test(text)) {
         return "high";
     }
@@ -193,14 +247,37 @@ function riskSeverity(flag) {
     return "low";
 }
 
-function renderRiskFlags(flags = []) {
-    const normalized = flags.map(humanize).filter(Boolean);
+function countMissingFields(record = {}) {
+    if (Number.isFinite(Number(record.missing_field_count))) {
+        return Number(record.missing_field_count);
+    }
+    const extraction = record.extraction || {};
+    return Object.entries(extraction)
+        .filter(([key, field]) => {
+            if (["directions", "risk_flags", "legal_phrases"].includes(key) || !field || typeof field !== "object") return false;
+            const value = field.value;
+            return value === null || value === undefined || value === "" || (Array.isArray(value) && !value.length) || String(value).trim().toLowerCase() === "unknown";
+        }).length;
+}
+
+function formatRiskFlag(flag, record = {}) {
+    if (String(flag || "").toLowerCase() === "llm_case_details_failed") {
+        const count = countMissingFields(record);
+        if (!count) return "Fields not filled";
+        return `${count} ${count === 1 ? "field" : "fields"} not filled`;
+    }
+    return humanize(flag);
+}
+
+function renderRiskFlags(flags = [], record = {}) {
+    const normalized = flags.map((flag) => formatRiskFlag(flag, record)).filter(Boolean);
     if (!normalized.length) {
         return `<span class="risk-chip risk-low">Clear</span>`;
     }
-    return normalized.map((flag) => {
-        const severity = riskSeverity(flag);
-        return `<span class="risk-chip risk-${severity}">${escapeHtml(flag)}</span>`;
+    return flags.map((rawFlag, index) => {
+        const label = normalized[index] || formatRiskFlag(rawFlag, record);
+        const severity = riskSeverity(rawFlag);
+        return `<span class="risk-chip risk-${severity}">${escapeHtml(label)}</span>`;
     }).join("");
 }
 
@@ -284,7 +361,7 @@ function renderMetrics(containerId, metrics = {}) {
         ["Duplicates", metrics.duplicate_count ?? 0],
         ["Ambiguity", metrics.ambiguous_count ?? 0],
         ["Reviewer edits", metrics.review_edit_count ?? 0],
-        ["OCR", metrics.ocr_used ? "Used" : "Not used"],
+        ["OCR", metrics.ocr_used ? (metrics.vision_ocr_used ? "Vision OCR" : "Used") : "Not used"],
     ];
     document.getElementById(containerId).innerHTML = items.map(([label, value]) => `
         <div class="metric-card"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>
@@ -307,7 +384,7 @@ function renderQueue(records) {
             <td>${escapeHtml(record.court || "Unknown court")}</td>
             <td>${escapeHtml(formatInlineList(record.departments, "Owner unclear"))}</td>
             <td>${statusPill(record.review_status || "pending_review")}</td>
-            <td><div class="risk-stack">${renderRiskFlags(record.risk_flags || [])}</div></td>
+            <td><div class="risk-stack">${renderRiskFlags(record.risk_flags || [], record)}</div></td>
             <td>
                 <div class="queue-actions">
                     <button class="ghost-btn" data-record-id="${escapeHtml(record.record_id)}">Review</button>
@@ -324,23 +401,78 @@ function renderQueue(records) {
     });
 }
 
+function normalizeActionRegister(record) {
+    const rows = Array.isArray(record.action_register) ? record.action_register.filter(Boolean) : [];
+    if (rows.length) {
+        return rows.map((row) => ({ ...row }));
+    }
+    const actions = normalizeDisplayList(record.pending_actions);
+    const dueDates = normalizeDisplayList(record.due_dates);
+    const departments = normalizeDisplayList(record.departments);
+    const categories = normalizeDisplayList(record.action_categories);
+    return (actions.length ? actions : ["No published action"]).map((title, index) => ({
+        title,
+        owner: departments[index] || departments[0] || "",
+        department: departments[index] || departments[0] || "",
+        category: categories[index] || categories[0] || "",
+        deadline: dueDates[index] || dueDates[0] || "",
+        timeline_type: dueDates[index] || dueDates[0] ? "specified" : "missing",
+        status: record.review_status || "approved",
+        evidence_count: 0,
+    }));
+}
+
+function formatDeadlineChip(action) {
+    const deadline = formatValue(action.deadline).trim();
+    const timeline = formatValue(action.timeline).trim();
+    if (deadline) {
+        return `<span class="deadline-chip deadline-dated">${escapeHtml(deadline)}</span>`;
+    }
+    if (timeline && !/not specified|no timeline|none/i.test(timeline)) {
+        return `<span class="deadline-chip deadline-text">${escapeHtml(timeline)}</span>`;
+    }
+    return `<span class="deadline-chip deadline-missing">Timeline not specified</span>`;
+}
+
+function formatEvidenceButton(record, action) {
+    const evidenceCount = Number(action.evidence_count || 0);
+    const page = action.evidence_page ? `p. ${action.evidence_page}` : "";
+    const label = evidenceCount ? `Source${page ? ` ${page}` : ""}` : "Open proof";
+    return `<button class="ghost-btn evidence-open-btn" data-record-id="${escapeHtml(record.record_id)}">${escapeHtml(label)}</button>`;
+}
+
 function renderDashboard(records) {
     const body = document.getElementById("recordsTableBody");
     if (!records.length) {
         body.innerHTML = `<tr><td colspan="7">No verified records yet. Approve a judgment to publish it here.</td></tr>`;
         return;
     }
-    body.innerHTML = records.map((record) => `
-        <tr>
-            <td>${escapeHtml(record.case_number || "Unknown case")}</td>
-            <td>${escapeHtml(formatList(record.departments, "Unassigned"))}</td>
-            <td>${escapeHtml(formatList(record.pending_actions, "No actions"))}</td>
-            <td>${escapeHtml(formatList((record.action_categories || []).map(humanize), "N/A"))}</td>
-            <td>${escapeHtml(formatList(record.due_dates, "N/A"))}</td>
-            <td>${statusPill(record.review_status || "approved")}</td>
-            <td><button class="ghost-btn" data-record-id="${escapeHtml(record.record_id)}">Open</button></td>
-        </tr>
-    `).join("");
+    body.innerHTML = records.flatMap((record) => {
+        const actions = normalizeActionRegister(record);
+        return actions.map((action) => {
+            const owner = action.owner || action.department || formatList(record.departments, "Owner unclear");
+            const category = action.category ? `<span class="register-meta">${escapeHtml(humanize(action.category))}</span>` : "";
+            const rowStatus = record.review_status || action.status || "approved";
+            const judgmentDate = formatValue(record.judgment_date);
+            return `
+                <tr>
+                    <td>
+                        <strong class="register-case">${escapeHtml(record.case_number || "Unknown case")}</strong>
+                        ${judgmentDate ? `<span class="register-meta">${escapeHtml(judgmentDate)}</span>` : ""}
+                    </td>
+                    <td>${escapeHtml(record.court || "Unknown court")}</td>
+                    <td>
+                        <strong>${escapeHtml(formatValue(owner) || "Owner unclear")}</strong>
+                        ${category}
+                    </td>
+                    <td>${escapeHtml(formatValue(action.title) || "No action captured")}</td>
+                    <td>${formatDeadlineChip(action)}</td>
+                    <td>${statusPill(rowStatus)}</td>
+                    <td>${formatEvidenceButton(record, action)}</td>
+                </tr>
+            `;
+        });
+    }).join("");
     body.querySelectorAll("button[data-record-id]").forEach((button) => {
         button.addEventListener("click", () => loadRecord(button.dataset.recordId));
     });
@@ -392,6 +524,10 @@ function renderField(fieldKey, field) {
                 </select>
                 <select data-field-reason>${reviewReasonOptions(field.reason || "")}</select>
             </div>
+            <label class="manual-override-row">
+                <input type="checkbox" data-field-manual-override ${field.manual_override ? "checked" : ""}>
+                <span>Manual override</span>
+            </label>
             <div class="evidence ${evidence ? "" : "missing-evidence"}">${escapeHtml(evidenceText)}</div>
             <div class="field-provenance ${evidence ? "" : "missing-evidence"}">${escapeHtml(citation)}</div>
             ${renderEvidenceList(evidenceItems)}
@@ -461,6 +597,12 @@ function renderAction(action, index = 0) {
                             <span data-edit-icon aria-hidden="true">✎</span>
                         </span>
                     </span>
+                    <span class="source-proof-note">
+                        <label class="manual-override-row">
+                            <input type="checkbox" data-prop="manual_override" ${action.manual_override ? "checked" : ""}>
+                            <span>Manual override</span>
+                        </label>
+                    </span>
                 </label>
             </div>
         </div>
@@ -481,7 +623,7 @@ function renderWarnings(record) {
     if (record.duplicate_candidates && record.duplicate_candidates.length) {
         flags.push("possible duplicate");
     }
-    document.getElementById("recordWarnings").innerHTML = flags.map((flag) => `<span>${escapeHtml(humanize(flag))}</span>`).join("");
+    document.getElementById("recordWarnings").innerHTML = flags.map((flag) => `<span>${escapeHtml(formatRiskFlag(flag, record))}</span>`).join("");
 }
 
 async function loadRecord(recordId) {
@@ -574,18 +716,18 @@ async function loadAudit(recordId) {
     const events = payload.events || [];
     document.getElementById("auditTimeline").innerHTML = events.length ? events.map((event) => `
         <div class="audit-event">
-            <strong>${escapeHtml(humanize(event.event_type))}</strong>
+            <strong>${escapeHtml(humanizeAuditLabel(event.event_type))}</strong>
             <span>${escapeHtml(event.created_at || "")}</span>
-            <p>${escapeHtml(event.notes || event.reason || "")}</p>
+            <p>${escapeHtml(formatAuditValue(event.notes || event.reason || ""))}</p>
             ${event.before || event.after ? `<p>${escapeHtml(auditDiff(event.before, event.after))}</p>` : ""}
         </div>
     `).join("") : "No audit events yet.";
 }
 
 function auditDiff(before, after) {
-    const beforeValue = typeof before === "object" && before ? before.value ?? before.status ?? formatValue(before) : before;
-    const afterValue = typeof after === "object" && after ? after.value ?? after.status ?? formatValue(after) : after;
-    return `Before: ${formatValue(beforeValue) || "None"} | After: ${formatValue(afterValue) || "None"}`;
+    const beforeValue = auditSummaryValue(before);
+    const afterValue = auditSummaryValue(after);
+    return `Before: ${formatAuditValue(beforeValue) || "None"} | After: ${formatAuditValue(afterValue) || "None"}`;
 }
 
 async function loadRecordMetrics(recordId) {
@@ -678,13 +820,13 @@ function collectReviewPayload(decision) {
             value: card.querySelector("[data-field-value]").value,
             status: card.querySelector("[data-field-status]").value,
             reason: card.querySelector("[data-field-reason]").value,
-            manual_override: card.querySelector("[data-field-status]").value === "manually_entered",
+            manual_override: card.querySelector("[data-field-manual-override]").checked,
         };
     });
     const actionUpdates = Array.from(document.querySelectorAll(".action-card")).map((card) => {
         const update = { action_id: card.dataset.actionId };
         card.querySelectorAll("[data-prop]").forEach((input) => {
-            update[input.dataset.prop] = input.value;
+            update[input.dataset.prop] = input.type === "checkbox" ? input.checked : input.value;
         });
         if (decision === "reject") update.status = "rejected";
         if (decision === "approve" && !update.status) update.status = "approved";
@@ -832,6 +974,9 @@ document.getElementById("ccmsForm").addEventListener("submit", async (event) => 
 document.getElementById("demoSeedBtn").addEventListener("click", () => loadDemoSeed().catch((error) => showToast(error.message)));
 document.getElementById("refreshBtn").addEventListener("click", () => refreshAll().catch((error) => showToast(error.message)));
 document.getElementById("exportCsvBtn").addEventListener("click", () => exportCsv().catch((error) => showToast(error.message)));
+document.getElementById("pdfInput").addEventListener("change", (event) => {
+    document.getElementById("pdfFileName").textContent = event.target.files?.[0]?.name || "No judgment selected";
+});
 document.getElementById("filterCase").addEventListener("input", () => refreshAll().catch((error) => showToast(error.message)));
 document.getElementById("filterDepartment").addEventListener("input", () => refreshAll().catch((error) => showToast(error.message)));
 document.getElementById("filterActionType").addEventListener("change", () => refreshAll().catch((error) => showToast(error.message)));
