@@ -208,6 +208,42 @@ def test_repository_duplicate_detection_and_approval_guard(workspace_tmp_path: P
     asyncio.run(run())
 
 
+def test_hash_cache_survives_visible_record_deletion(workspace_tmp_path: Path):
+    from judgment_workflow.hash_cache import JudgmentHashCache
+    from judgment_workflow.repository import JudgmentRepository
+
+    async def run():
+        storage = get_storage_backend(
+            StorageConfig(backend_type="sqlite", sqlite_db_path=str(workspace_tmp_path / "judgments.db"))
+        )
+        await storage.initialize()
+        repository = JudgmentRepository(storage=storage, canvas_app_id="test-app")
+        hash_cache = JudgmentHashCache(workspace_tmp_path / "hash_cache.db")
+
+        package = build_judgment_review_package(_sample_documents(), {"source_system": "manual_upload"})
+        stored = await repository.create_record(
+            user_id="user-1",
+            record_id="record-1",
+            review_package=package,
+            source_metadata={"source_system": "manual_upload"},
+            original_pdf_path=str(workspace_tmp_path / "original.pdf"),
+            document_hash="same-hash",
+        )
+        hash_cache.put(user_id="user-1", document_hash="same-hash", record=stored)
+
+        await repository.delete_record("user-1", "record-1")
+
+        assert await repository.get_cached_record_by_hash("user-1", "same-hash") is None
+        cached = hash_cache.get(user_id="user-1", document_hash="same-hash")
+        assert cached is not None
+        assert cached["record_id"] == "record-1"
+        assert cached["extraction"]["case_number"]["value"] == "Writ Petition No. 1234 of 2025"
+        assert cached["action_items"]
+        await storage.close()
+
+    asyncio.run(run())
+
+
 def test_question_answer_is_grounded_in_record():
     from judgment_workflow.api import _answer_from_record
     from judgment_workflow.serialization import serialize_review_package

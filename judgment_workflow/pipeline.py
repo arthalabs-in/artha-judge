@@ -15,6 +15,7 @@ from rag.judgment.owner_resolution import apply_inferred_action_owner
 from .config import JUDGMENT_DATA_ROOT
 from .document_layers import extract_layered_pdf_documents, metadata_for_metrics
 from .document_profile import compute_document_hash, profile_from_ocr_status
+from .hash_cache import JudgmentHashCache
 from .llm_extractor import enrich_review_package_with_llm
 from .llm_review_workflow import build_llm_first_review_package
 from .ocr import detect_ocr_need, ocr_pdf_with_tesseract
@@ -71,16 +72,23 @@ async def process_judgment_file(
         source_metadata.setdefault("original_file_name", original_file_name)
     source_metadata["llm_enabled"] = bool(llm_enabled)
     repository = JudgmentRepository(storage=storage, canvas_app_id=canvas_app_id)
+    hash_cache = JudgmentHashCache()
 
     if progress_callback:
         progress_callback(stage="judgment_processing", message="Extracting judgment content...", pct=15.0)
 
     document_hash = await timed_to_thread("document_hash", compute_document_hash, pdf_path)
-    cached_record = await repository.get_cached_record_by_hash(
-        user_id,
-        document_hash,
-        exclude_record_id=record_id,
-    )
+    cached_record = await asyncio.to_thread(hash_cache.get, user_id=user_id, document_hash=document_hash)
+    if cached_record:
+        source_metadata["cache_source"] = "hash_cache"
+    else:
+        cached_record = await repository.get_cached_record_by_hash(
+            user_id,
+            document_hash,
+            exclude_record_id=record_id,
+        )
+        if cached_record:
+            source_metadata["cache_source"] = "record_history"
     if cached_record:
         return await _create_cached_record_replay(
             repository=repository,
@@ -354,6 +362,7 @@ async def process_judgment_file(
     record_stage("record_metadata_update", stage_started_at)
     processing_metrics["stage_timings"] = stage_timings
     record["processing_metrics"] = processing_metrics
+    await asyncio.to_thread(hash_cache.put, user_id=user_id, document_hash=document_hash, record=record)
 
     if progress_callback:
         progress_callback(stage="complete", message="Judgment workflow complete.", pct=100.0)
